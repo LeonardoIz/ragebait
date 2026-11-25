@@ -1,6 +1,6 @@
-# victory-fork: notas de trabajo heredadas
+# victory-fork: inherited work notes
 
-Registro de mediciones y experimentos de victory-fork hasta el commit `6d20eed` (2026-11-25), movido aquí desde su README sin cambios. Los switches `VICTORY_*` citados siguen existiendo en el código.
+victory-fork's measurement and experiment log up to commit `6d20eed` (2026-11-25), moved here unchanged from its README. The `VICTORY_*` switches it names still exist in the code.
 
 ## Status of this fork (2026-11-25)
 

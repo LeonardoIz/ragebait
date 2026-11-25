@@ -2,107 +2,112 @@
   <img src="docs/logo.png" alt="ragebait" width="640">
 </p>
 
-**ragebait** ejecuta el título de Xbox Series de forma nativa en Windows a
-partir de **tu propio dump** del juego. El código x86-64 del título corre sin
-cambios dentro de nuestro proceso; ragebait le da la plataforma que espera
-(servicios del sistema, D3D12.X sobre D3D12, shaders de consola recompilados a
-DXIL).
+**ragebait** runs the Xbox Series title natively on Windows from **your own
+dump** of the game. The title's x86-64 code runs unchanged inside our
+process; ragebait supplies the platform it expects (system services, D3D12.X
+on host D3D12, console shaders recompiled to DXIL).
 
-Es un hard fork de [victory-fork](https://github.com/fxceless/victory-fork),
-a su vez fork de [VIctory](https://github.com/Marvisak/VIctory).
+A hard fork of [victory-fork](https://github.com/fxceless/victory-fork),
+itself a fork of [VIctory](https://github.com/Marvisak/VIctory).
 
-> **Este repositorio no contiene archivos, código ni assets del juego.**
-> Necesitas tu propia copia. Sin relación con el desarrollador ni con el
-> editor del juego. Ver [docs/asset-policy.md](docs/asset-policy.md).
+> **This repository contains no game files, code or assets.** You need your
+> own copy. Not affiliated with or endorsed by the game's developer or
+> publisher. See [docs/asset-policy.md](docs/asset-policy.md).
 
-## Objetivos
+## Goals
 
-1. **Recursos.** Bajar el uso de CPU, RAM y VRAM: hoy el proceso ocupa unos
-   24 GB y la tarjeta va llena, y la mayoría de los cuellos de botella vienen
-   de ahí.
-2. **Precompilación.** Hacer por adelantado todo lo posible (shaders,
-   pipelines, texturas) para que la ejecución en tiempo real cargue menos.
-3. **Patches y mods.** Un sistema para modificar el propio juego, no solo la
-   capa, y poder optimizar también desde dentro.
+1. **Resources.** Cut CPU, RAM and VRAM use: the process holds about 24 GB
+   and the card is full, and most bottlenecks come from there.
+2. **Precompilation.** Do everything possible ahead of time (shaders,
+   pipelines, textures) so the real-time path carries less.
+3. **Patches and mods.** A system to change the game itself, not only the
+   layer, so it can be optimized from the inside too.
 
-## Estado
+## Status
 
-**Todavía no es jugable.** Punto de partida heredado de victory-fork
+**Not playable yet.** Starting point inherited from victory-fork
 (2026-11-25; i7-14700KF, RTX 4070 12 GB, 32 GB RAM):
 
-| Fase | Estado |
-|------|--------|
-| Arranque, menús, pantalla de inicio | funciona, 30 fps |
-| Cinemática inicial | se reproduce completa, 5–8,5 fps |
-| Guardado | autoguardado y carga funcionan |
-| Primera escena jugable | se renderiza (personajes, cielo, HUD, mando), 8–10 fps |
-| Luz en sombra | negra: la iluminación por ray tracing aún no funciona |
-| Memoria | ~24 GB de proceso, VRAM llena desde el primer frame |
+| Stage | State |
+|-------|-------|
+| Boot, menus, start screen | works, 30 fps |
+| Opening cutscene | plays to the end, 5–8.5 fps |
+| Saves | autosave and load work |
+| First gameplay scene | renders (characters, sky, HUD, pad), 8–10 fps |
+| Light in shadow | black: ray-traced lighting does not run yet |
+| Memory | ~24 GB process, VRAM full from the first frame |
 
-Mediciones y experimentos anteriores: [docs/victory-fork-log.md](docs/victory-fork-log.md).
+Earlier measurements and experiments: [docs/victory-fork-log.md](docs/victory-fork-log.md).
 
-## Empezar
+## Getting started
 
-Requisitos: Windows 10/11 x64, CPU con AVX2, GPU Direct3D 12 con shader
-model 6.6 y mesh shaders, Rust (versión fijada en `rust-toolchain.toml`).
-El título necesita varios GiB de commit libre al arrancar; si `crashes.log`
-muestra el error 1455, amplía el archivo de paginación.
+Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+shader model 6.6 and mesh shaders, Rust (pinned in `rust-toolchain.toml`).
+The title needs several GiB of free commit at startup; if `crashes.log`
+reports Windows error 1455, enlarge the paging file.
 
 ```powershell
-cargo xtask install-hooks                # comprobación de la política de assets en cada commit
-copy victory.example.toml victory.toml   # pon tus rutas (fuera del repo)
-cargo test --workspace                   # no necesita datos del juego
-cargo run -p victory -- config           # comprueba las rutas
+cargo xtask install-hooks                # asset-policy check on every commit
+copy victory.example.toml victory.toml   # set your paths (outside the repo)
+cargo test --workspace                   # needs no game data
+cargo run -p victory -- config           # check your paths
 ```
 
-Precompilar shaders y ejecutar:
+Precompile shaders and run:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --warm all --jobs 16   # sin rutas: el game_dir de victory.toml
-target\release\victory.exe run <dir del juego>\<exe del título> --execute
+target\release\victory.exe translate --warm all --jobs 16   # no paths: game_dir from victory.toml
+target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-La mejor combinación de switches medida hasta ahora está en
-[diagnostics/README.md](diagnostics/README.md). Cada switch `VICTORY_*` está
-documentado en un comentario donde se lee.
+The best switch set measured so far is in
+[diagnostics/README.md](diagnostics/README.md). Each `VICTORY_*` switch is
+described in a comment where it is read.
 
-Build de diagnóstico (logs, perfilador, capturas):
+Diagnostics build (logs, profiler, captures):
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-| Variable | Efecto |
+| Variable | Effect |
 |----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | logs de depuración |
-| `VICTORY_D3D12_DEBUG=1` / `VICTORY_D3D12_DRED=1` | capa de depuración de D3D12 / datos de fallo de GPU |
-| `VICTORY_D3D12_WARP=1` | adaptador por software (lento, no puede tumbar el driver) |
-| `VICTORY_GPU_TIMING=1` | cada lista medida por separado |
-| `VICTORY_SHOT=<carpeta>` | captura de un frame completo |
-| `VICTORY_FRAME_LOG=1` | duración y desglose de cada frame |
+| `VICTORY_LOG=<target>=debug,...` | debug output |
+| `VICTORY_D3D12_DEBUG=1` / `VICTORY_D3D12_DRED=1` | D3D12 debug layer / GPU failure data |
+| `VICTORY_D3D12_WARP=1` | software adapter (slow; cannot reset the driver) |
+| `VICTORY_GPU_TIMING=1` | each list timed on its own |
+| `VICTORY_SHOT=<folder>` | capture of one whole frame |
+| `VICTORY_FRAME_LOG=1` | length and breakdown of every frame |
 
-Controles: mandos XInput. Sin mando, el teclado hace de mando (WASD/IJKL
-sticks, flechas cruceta, Enter/Backspace/X/Y botones, Q/E/Z/C gatillos,
-Esc/Tab Menú/Vista).
+Input: XInput pads. With none connected the keyboard is a pad (WASD/IJKL
+sticks, arrows D-pad, Enter/Backspace/X/Y buttons, Q/E/Z/C shoulders and
+triggers, Esc/Tab Menu/View).
 
-## Ramas
+## Branches
 
-- `main`: desarrollo de ragebait.
-- `upstream`: copia exacta de `main` de victory-fork, para traer cambios con
-  `git merge upstream`.
+- `main`: ragebait development.
+- `victory-fork`: mirror of victory-fork's `main` (remote `victory-fork`).
+- `victory`: mirror of upstream VIctory's `main` (remote `victory`).
 
-## Créditos
+Update a mirror and bring changes in:
 
-- [VIctory](https://github.com/Marvisak/VIctory), de Marvisak y
-  colaboradores: el loader, los servicios, el backend D3D12 y el recompilador
-  de shaders.
-- [victory-fork](https://github.com/fxceless/victory-fork), de fxceless y
-  colaboradores, con aportaciones de myokex, Joshua Odom y los autores de los
-  pull requests que cita su historial.
-- [XCL](https://github.com/ivall/xcl), de ivall, como referencia de
-  comportamiento.
+```powershell
+git fetch victory-fork
+git branch -f victory-fork victory-fork/main
+git merge victory-fork            # or cherry-pick single commits
+```
 
-## Licencia
+## Credits
 
-GPL-3.0-or-later. Ver [LICENSE](LICENSE).
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and
+  contributors: the loader, runtime services, D3D12 back end and shader
+  recompiler.
+- [victory-fork](https://github.com/fxceless/victory-fork) by fxceless and
+  contributors, with work by myokex, Joshua Odom and the pull-request authors
+  named in its history.
+- [XCL](https://github.com/ivall/xcl) by ivall, as a behaviour reference.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
