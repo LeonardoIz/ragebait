@@ -98,7 +98,7 @@ struct Ready {
 // by nobody until it is taken out.
 unsafe impl Send for Ready {}
 
-static READY: Mutex<Vec<Ready>> = Mutex::new(Vec::new());
+static READY: OnceLock<Mutex<Vec<Ready>>> = OnceLock::new();
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -163,7 +163,7 @@ impl Batch {
         STATS[5].fetch_add(left, Relaxed);
         list.close();
         let heap = HeldHeap::new(crate::descriptor::heap(self.heap));
-        lock(&READY).push(Ready { list, publish, _heap: heap });
+        lock(READY.get_or_init(Mutex::default)).push(Ready { list, publish, _heap: heap });
     }
 }
 
@@ -175,13 +175,12 @@ impl Drop for Batch {
 
 /// The upload lists ready now, for the submission about to be made, which
 /// runs them ahead of its own lists; their host slots are given their views.
-/// Called by the thread that submits.
+/// Called with the submission lock held.
 pub(crate) fn take_ready() -> Vec<HostList> {
-    // (Asked without the lock by every submission of a run without it.)
-    if JOB.get().is_none() {
+    let Some(queue) = READY.get() else {
         return Vec::new();
-    }
-    let ready = std::mem::take(&mut *lock(&READY));
+    };
+    let ready = std::mem::take(&mut *lock(queue));
     STATS[2].fetch_add(ready.len() as u64, Relaxed);
     ready
         .into_iter()
@@ -284,5 +283,38 @@ fn worker() {
         while make_way() {
             std::thread::yield_now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn synchronous_submission_runs_and_releases_ready_uploads_first() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = crate::descriptor::tests::test_heap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let marker = Arc::new(());
+        let mut batch = Batch::new(crate::descriptor::heap(heap));
+        let (upload_seen, held) = (seen.clone(), marker.clone());
+        batch.list().unwrap().defer_host(move || {
+            let _held = &held;
+            lock(&upload_seen).push("upload");
+        });
+        drop(batch);
+        assert_eq!(crate::object::release_boxed::<Heap>(heap), 1);
+
+        let title = host.new_list().unwrap();
+        let title_seen = seen.clone();
+        title.defer_host(move || lock(&title_seen).push("title"));
+        title.close();
+        host.execute(&[&title]);
+
+        assert_eq!(*lock(&seen), ["upload", "title"]);
+        assert_eq!(Arc::strong_count(&marker), 1);
     }
 }

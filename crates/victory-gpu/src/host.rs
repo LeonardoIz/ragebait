@@ -2940,13 +2940,11 @@ struct Sent {
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
 
-impl Sent {
-    fn keep_uploads(&mut self, lists: &mut Vec<crate::list::Detached>, order: &mut Vec<usize>) {
-        if !self.uploads.is_empty() {
-            let first = lists.len();
-            order.splice(0..0, first..first + self.uploads.len());
-            lists.extend(self.uploads.drain(..).map(crate::list::Detached::ours));
-        }
+fn keep_uploads(uploads: Vec<HostList>, lists: &mut Vec<crate::list::Detached>, order: &mut Vec<usize>) {
+    if !uploads.is_empty() {
+        let first = lists.len();
+        order.splice(0..0, first..first + uploads.len());
+        lists.extend(uploads.into_iter().map(crate::list::Detached::ours));
     }
 }
 
@@ -5738,12 +5736,12 @@ impl Host {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)
         };
-        let Some((mut submitted, mut sent)) = sent else {
+        let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
         };
-        sent.keep_uploads(&mut lists, &mut order);
+        keep_uploads(sent.uploads, &mut lists, &mut order);
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -5793,12 +5791,12 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, mut sent)) = self.submit(&[list], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], true) else {
             return 0;
         };
         let number = sent.number;
         let (mut lists, mut order) = (Vec::new(), Vec::new());
-        sent.keep_uploads(&mut lists, &mut order);
+        keep_uploads(sent.uploads, &mut lists, &mut order);
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -5991,7 +5989,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // Publish ready texture descriptors under the same lock that sends
         // their upload lists ahead of any draws that can read those slots.
-        let uploads = if late { crate::heap_worker::take_ready() } else { Vec::new() };
+        let uploads = crate::heap_worker::take_ready();
         let with_uploads;
         let runs = if uploads.is_empty() {
             runs
@@ -6308,6 +6306,11 @@ impl Host {
         // their notes can go.
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        if !uploads.is_empty() {
+            let (mut lists, mut order) = (Vec::new(), Vec::new());
+            keep_uploads(uploads, &mut lists, &mut order);
+            crate::list::recycle(lists, &order);
         }
         working(was_working);
         None

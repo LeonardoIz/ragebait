@@ -1339,7 +1339,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -1351,6 +1351,14 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_heap() -> This {
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 1, flags: 0, nodes: 0 };
+        let mut heap = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut heap), S_OK);
+        heap
     }
 
     #[cfg(windows)]
