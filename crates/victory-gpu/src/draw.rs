@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
+use crate::ambient;
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -1600,7 +1601,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, p, false, None) {
             return false;
         }
         let l = &list.list;
@@ -1679,7 +1680,13 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        mut ambient: Option<(ambient::Selection<'_>, &mut Option<ambient::Views>)>,
+    ) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1748,6 +1755,12 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
                 return false;
+            }
+            if let Some((selection, views)) = &mut ambient {
+                **views = self.ambient_views(&t.used, &made, selection);
+                if views.is_none() {
+                    once!(shader = %stage.shader.hash, "ambient selector did not match compatible bound views");
+                }
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -3211,7 +3224,17 @@ impl State {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
         self.dispatch_spread = [row, asked];
-        let bound = self.bind(list, p, true);
+        let mut ambient_views = None;
+        let ambient = if gx != 0 && gy != 0 && gz != 0 {
+            p.stages
+                .first()
+                .and_then(|stage| ambient::select(&stage.shader.hash))
+        } else {
+            None
+        };
+        let bound = self.bind(
+            list, p, true, ambient.map(|selection| (selection, &mut ambient_views)),
+        );
         self.dispatch_spread = [0, 0];
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3235,6 +3258,73 @@ impl State {
             crate::framelog::add(crate::framelog::T::ThreadDispatches, 1);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(views) = ambient_views
+            && ambient::after(list, views)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    fn ambient_views(
+        &self,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+        selection: &ambient::Selection<'_>,
+    ) -> Option<ambient::Views> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R32_UINT,
+        };
+
+        if self.heaps[0] == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let host = heap.host()?;
+        let entry = |binding: &ambient::Binding, kind| {
+            if !used.iter().any(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (binding.slot, binding.dword)
+            }) {
+                return None;
+            }
+            let Root::Table(table) = self.compute.get(usize::from(binding.slot))? else {
+                return None;
+            };
+            let handle = table.checked_add(u64::from(binding.dword) * 4)?;
+            let title_index = heap.index(handle)?;
+            if heap.handle(title_index) != Some(handle) || heap.index(*table).is_none() {
+                return None;
+            }
+            let index = if let Some(&(_, offset)) = made.iter().find(|m| m.0 == binding.slot) {
+                offset / 32 + binding.dword / 8
+            } else {
+                if title_index >= host.count() {
+                    return None;
+                }
+                title_index
+            };
+            Some((crate::descriptor::view(handle)?, host.gpu_handle(index)))
+        };
+        let (image, image_handle) = entry(selection.image, ResourceType::Uav)?;
+        let format = if selection.depth.is_some() {
+            DXGI_FORMAT_R32_UINT
+        } else {
+            DXGI_FORMAT_R11G11B10_FLOAT
+        };
+        let (output, size) = ambient::image(&image, Some(format))?;
+        let depth = if let Some(binding) = selection.depth {
+            let (view, handle) = entry(binding, ResourceType::Srv)?;
+            let (resource, depth_size) = ambient::image(&view, None)?;
+            if resource == output || depth_size != size {
+                return None;
+            }
+            Some(handle)
+        } else {
+            None
+        };
+        Some(ambient::Views { image: image_handle, depth, size })
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4435,7 +4525,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind(list, p, true, None),
             _ => false,
         };
         if !ran {
