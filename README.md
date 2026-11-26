@@ -25,19 +25,24 @@ itself a fork of [VIctory](https://github.com/Marvisak/VIctory).
 
 ## Status
 
-**Not playable yet.** Starting point inherited from victory-fork
-(2026-11-25; i7-14700KF, RTX 4070 12 GB, 32 GB RAM):
+**Status page:** [rb.l7i3.dev](https://rb.l7i3.dev) (progress and changelog)
+
+**Not playable yet.** Measured on the ragebait test machine (2026-11-26;
+laptop, Ryzen 7 260, RTX 5060 Laptop 8 GB, 32 GB RAM):
 
 | Stage | State |
 |-------|-------|
-| Boot, menus, start screen | works, 30 fps |
-| Opening cutscene | plays to the end, 5–8.5 fps |
-| Saves | autosave and load work |
-| First gameplay scene | renders (characters, sky, HUD, pad), 8–10 fps |
+| Boot, menus, start screen | works |
+| Opening scene, Series X mode | renders in 3D, about 2–15 fps |
+| Opening scene, Series S mode | renders in 3D (plain upscale in place of the console FSR), same fps |
+| Crash after ~2 minutes (device lost) | fixed |
 | Light in shadow | black: ray-traced lighting does not run yet |
-| Memory | ~24 GB process, VRAM full from the first frame |
+| Memory | ~24 GB process; the 8 GB card fills, smaller card copies keep rendering steadier |
+| Bottleneck | CPU side of the layer (submit thread, page remapping); the GPU idles most of each frame |
 
-Earlier measurements and experiments: [docs/victory-fork-log.md](docs/victory-fork-log.md).
+victory-fork measured 8–10 fps in the first gameplay scene on a different
+machine (i7-14700KF, RTX 4070 12 GB); the two sets of numbers are not
+comparable. Its measurements and experiments: [docs/victory-fork-log.md](docs/victory-fork-log.md).
 
 ## Getting started
 
