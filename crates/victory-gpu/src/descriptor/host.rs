@@ -2162,17 +2162,17 @@ impl HostHeap {
                     views.slots.forget(words);
                     return false;
                 };
-                if views.kept.len() <= at as usize {
-                    views.kept.resize(at as usize + 1, None);
+                if views.slots.kept.len() <= at as usize {
+                    views.slots.kept.resize(at as usize + 1, None);
                 }
-                views.kept[at as usize] = kept;
+                views.slots.kept[at as usize] = kept;
                 add(T::ListViewsMade, 1);
             } else {
                 add(T::ListViewsCopied, 1);
             }
             // SAFETY: a slot of our heap, and one of this thread's heap of the same type.
             unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
-            self.keep(index, views.kept[at as usize].clone());
+            self.keep(index, views.slots.kept[at as usize].clone());
             true
         })
     }
@@ -4182,6 +4182,12 @@ struct ListSlots {
     recording: u64,
     /// By record key, host texture and first level shown.
     made: std::collections::HashMap<[u64; 3], u32>,
+    /// What each slot's descriptor views, kept by the slots it is copied to.
+    /// Let go when a new recording starts: the heap slots it was copied to
+    /// keep their own reference (`HostHeap::keep`), and the list holds its
+    /// host copies until it completes, so it no longer pins textures until
+    /// a later recording reuses the same slot.
+    kept: Vec<Kept>,
 }
 
 impl ListSlots {
@@ -4193,6 +4199,7 @@ impl ListSlots {
         if self.recording != recording {
             self.recording = recording;
             self.made.clear();
+            self.kept.clear();
         }
         if let Some(&at) = self.made.get(&words) {
             return Some((at, false));
@@ -4215,8 +4222,6 @@ impl ListSlots {
 /// ([`HostHeap::make_listed`]), in a heap the card does not see.
 struct ListViews {
     slots: ListSlots,
-    /// What each slot's descriptor views, kept by the slots it is copied to.
-    kept: Vec<Kept>,
     start: usize,
     step: usize,
     _heap: ID3D12DescriptorHeap,
@@ -4236,7 +4241,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { slots: ListSlots::default(), kept: Vec::new(), start, step, _heap: heap })
+            Some(ListViews { slots: ListSlots::default(), start, step, _heap: heap })
         }
     }
 
@@ -4292,6 +4297,18 @@ mod tests {
         }
         assert_eq!(slots.find(2, [7; 3]), None);
         assert_eq!(slots.find(2, b), Some((0, false)));
+    }
+
+    #[test]
+    fn a_new_recording_lets_go_of_the_views_kept_for_the_last() {
+        let mut slots = ListSlots::default();
+        assert_eq!(slots.find(1, [1; 3]), Some((0, true)));
+        slots.kept.resize(1, None);
+        // The same recording keeps them.
+        assert_eq!(slots.find(1, [2; 3]), Some((1, true)));
+        assert_eq!(slots.kept.len(), 1);
+        assert_eq!(slots.find(2, [1; 3]), Some((0, true)));
+        assert!(slots.kept.is_empty());
     }
 
     #[test]

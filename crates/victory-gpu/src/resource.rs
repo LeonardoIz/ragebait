@@ -1189,7 +1189,7 @@ struct Hosted {
 #[cfg(windows)]
 mod eviction;
 #[cfg(windows)]
-pub(crate) use eviction::{evict_if_pressured, eviction_enabled};
+pub(crate) use eviction::{evict_if_pressured, eviction_enabled, eviction_skipped, reuploaded};
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1352,8 +1352,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
-        let retry_at = r.host.retry_at.load(Relaxed);
-        if retry_at != 0 && crate::host::now_ms() < retry_at {
+        if !eviction::may_retry(r.host.retry_at.load(Relaxed), crate::host::now_ms()) {
             return None;
         }
         let clear = r
@@ -1406,11 +1405,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let texture = match result {
             Ok(texture) => texture,
             Err(error) => {
-                if eviction_enabled() && error == E_OUTOFMEMORY && fills(&r.desc) {
-                    eviction::request_after_oom();
-                    r.host.retry_at.store(crate::host::now_ms() + 1_000, Relaxed);
-                } else {
-                    r.host.refused.store(true, Relaxed);
+                match eviction::retry_at(eviction_enabled(), error == E_OUTOFMEMORY, fills(&r.desc), crate::host::now_ms()) {
+                    Some(at) => r.host.retry_at.store(at, Relaxed),
+                    None => r.host.refused.store(true, Relaxed),
                 }
                 return None;
             }
@@ -1433,9 +1430,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.filled = fills(&r.desc);
-        if r.host.evicted.swap(false, Relaxed) {
-            host.reupload.store(true, Relaxed);
-        }
+        eviction::carry_eviction(&r.host.evicted, &host.reupload);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1848,17 +1843,13 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let _reading = if evict {
-                let Some(reading) = crate::watch::title_memory_reading_now() else { continue };
-                Some(reading)
-            } else {
-                None
-            };
+            // As many go with eviction on as off: the next use uploads title memory
+            // either way. Eviction also keeps alias-copied (`THROUGH`) contents.
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
-                    && if evict { eviction::reloadable(at, r) } else { !crate::texture::host_wrote(at) }
+                    && if evict { !crate::texture::has_host_contents(at) } else { !crate::texture::host_wrote(at) }
             });
             if idle {
                 // Under the lock: the next use must not find the staging

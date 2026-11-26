@@ -6157,17 +6157,22 @@ impl Host {
             crate::descriptor::sync_heaps();
         }
         let behind = late && flying();
-        if !behind && crate::resource::eviction_enabled() {
+        if crate::resource::eviction_enabled() {
             static LAST_EVICTION_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let tenth = now_ms() / 100 + 1;
-            if LAST_EVICTION_CHECK.load(Ordering::Relaxed) != tenth
-                && STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire)
-            {
-                // SAFETY: the direct-queue fence is ours, under the submission lock.
-                let completed = unsafe { self.fence.GetCompletedValue() };
-                if completed != u64::MAX && completed >= *submitted {
+            if LAST_EVICTION_CHECK.load(Ordering::Relaxed) != tenth {
+                let idle = !behind
+                    && STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire)
+                    && {
+                        // SAFETY: the direct-queue fence is ours, under the submission lock.
+                        let completed = unsafe { self.fence.GetCompletedValue() };
+                        completed != u64::MAX && completed >= *submitted
+                    };
+                if idle {
                     LAST_EVICTION_CHECK.store(tenth, Ordering::Relaxed);
                     crate::resource::evict_if_pressured(self.video_memory());
+                } else {
+                    crate::resource::eviction_skipped(|| self.video_memory());
                 }
             }
         }
