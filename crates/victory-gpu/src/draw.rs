@@ -589,7 +589,7 @@ pub(crate) struct State {
     /// The number of this recording of the list, by which the views its
     /// tables hold are made once (`crate::descriptor::host::list_views`)
     /// and, in diagnostics builds, the tables it makes twice are told
-    /// ([`table_asked`]); 0 until its first fresh table.
+    /// ([`table_asked`]); 0 until its first fresh table that needs it.
     recording: u64,
 }
 
@@ -1315,6 +1315,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        // Without the cache the views are made and pushed straight away.
+        let cache = bind_cache();
+        let mut rtvs = Vec::new();
         let mut views = Vec::new();
         let mut keys: Vec<TargetKey> = Vec::new();
         for &h in handles {
@@ -1336,16 +1339,24 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    keys.push((0, record.key()));
-                    views.push((None, Some(desc)));
+                    if cache {
+                        keys.push((0, record.key()));
+                        views.push((None, Some(desc)));
+                    } else {
+                        rtvs.push(host.rtv(None, Some(&desc)));
+                    }
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            keys.push((texture.as_raw() as usize, record.key()));
-            views.push((Some(texture), record.desc()));
+            if cache {
+                keys.push((texture.as_raw() as usize, record.key()));
+                views.push((Some(texture), record.desc()));
+            } else {
+                rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            }
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -1360,15 +1371,15 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
-        if bind_cache() {
+        if cache {
             let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
             if self.host_targets.as_ref() == Some(&now) {
                 crate::framelog::add(crate::framelog::T::TargetsAgain, 1);
                 return;
             }
             self.host_targets = Some(now);
+            rtvs = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         }
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -3220,8 +3231,17 @@ impl State {
             victory_shader::emit::spread_groups(group_x, group_y, group_z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
-        } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+        } else if !groups_fit([gx, gy, gz]) {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+            // A thread-count dispatch the host cannot take (a spilled
+            // builder stage has no spread prologue) is a dropped stage.
+            if counted {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a thread-count dispatch has more groups than the host takes");
+                }
+                return;
+            }
         }
         self.dispatch_spread = [row, asked];
         let mut ambient_views = None;
@@ -3906,16 +3926,26 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
-            if self.recording == 0 {
-                self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
-            }
-            let listed = crate::descriptor::host::list_views().then_some(self.recording);
+            // Numbered only where used: diagnostics number it in `table_asked`.
+            let listed = crate::descriptor::host::list_views().then(|| {
+                if self.recording == 0 {
+                    self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
+                }
+                self.recording
+            });
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let handle = table + u64::from(k) * 32;
+                // With list views the view and its record key come from one
+                // read of the slot: a second read could see another record.
+                let (decoded, record) = match listed {
+                    Some(_) => crate::descriptor::view_and_key(handle).map_or((None, 0), |(view, key)| (Some(view), key)),
+                    None => (crate::descriptor::view(handle), 0),
+                };
+                match decoded {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -3932,10 +3962,7 @@ impl State {
                     Some(view) => {
                         // Made once in this recording, then copied
                         // ([`crate::descriptor::host::list_views`]).
-                        let copied = listed.is_some_and(|recording| {
-                            let words = crate::descriptor::record_at(table + u64::from(k) * 32);
-                            host.make_listed(recording, words, index, &view)
-                        });
+                        let copied = listed.is_some_and(|recording| host.make_listed(recording, record, index, &view));
                         if !copied {
                             host.make_at(index, &view);
                         }
@@ -4580,6 +4607,22 @@ fn thread_groups(threads: [u32; 3], size: [u32; 3], mask_x: bool) -> Option<([u3
         return None;
     }
     Some((std::array::from_fn(|i| threads[i].div_ceil(size[i])), partial))
+}
+
+/// Whether D3D12 takes a dispatch of `groups` (at most 65,535 per dimension).
+fn groups_fit(groups: [u32; 3]) -> bool {
+    groups.iter().all(|&g| g <= 65_535)
+}
+
+#[cfg(test)]
+#[test]
+fn a_counted_dispatch_past_the_group_limit_does_not_fit() {
+    let (groups, _) = thread_groups([4_194_241, 1, 1], [64, 1, 1], true).unwrap();
+    assert_eq!(groups, [65_536, 1, 1]);
+    let (_, _, gx, gy, gz) = victory_shader::emit::spread_groups(groups[0], groups[1], groups[2], false);
+    assert!(!groups_fit([gx, gy, gz]));
+    let (_, _, gx, gy, gz) = victory_shader::emit::spread_groups(groups[0], groups[1], groups[2], true);
+    assert!(groups_fit([gx, gy, gz]));
 }
 
 #[cfg(test)]

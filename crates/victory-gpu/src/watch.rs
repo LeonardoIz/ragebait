@@ -91,20 +91,28 @@ pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
 }
 
-/// Kernel answers (addresses of written 4 KiB pages, in order) as 64 KiB
-/// pages, each once, with their written parts (all of them without
-/// [`parts_on`]).
-fn pages_and_parts(found: &[usize]) -> Vec<(usize, u16)> {
-    let mut pages: Vec<(usize, u16)> = Vec::new();
+/// Notes the first `count` kernel answers in `j.found` (addresses of
+/// written 4 KiB pages, in order) as written by asking `now`: each 64 KiB
+/// page once, with its written parts (all of them without [`parts_on`]).
+/// Streams into the journal: nothing is allocated.
+fn note_found(j: &mut Journal, count: usize, now: u64) {
     let on = parts_on();
-    for &at in found {
+    let mut run: Option<(usize, u16)> = None;
+    for k in 0..count {
+        let at = j.found[k];
         let (page, part) = (at / PAGE, if on { 1u16 << (at % PAGE / KERNEL_PAGE) } else { WHOLE });
-        match pages.last_mut() {
+        match &mut run {
             Some((last, parts)) if *last == page => *parts |= part,
-            _ => pages.push((page, part)),
+            _ => {
+                if let Some((last, parts)) = run.replace((page, part)) {
+                    j.note(last, parts, now);
+                }
+            }
         }
     }
-    pages
+    if let Some((last, parts)) = run {
+        j.note(last, parts, now);
+    }
 }
 
 /// A title-memory range whose changed pages another subsystem needs to read.
@@ -444,9 +452,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for (page, parts) in pages_and_parts(&j.found[..count]) {
-        j.note(page, parts, now);
-    }
+    note_found(j, count, now);
     true
 }
 
@@ -470,6 +476,33 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut pages = Vec::new();
+    let now = writes_into(start, end, guarded, &mut pages)?;
+    Some((now, pages))
+}
+
+/// [`writes`] (guarded) handed to `use_pages` in this thread's answer
+/// buffer, kept from one asking to the next instead of a new list each
+/// time; the same answer. After kelvaroq native/patches/0053. (Asked again
+/// from inside `use_pages`, it answers in a list of its own.)
+pub(crate) fn with_writes<T>(start: usize, end: usize, use_pages: impl FnOnce(u64, &[(usize, u64)]) -> T) -> Option<T> {
+    thread_local! {
+        static PAGES: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    PAGES.with(|pages| match pages.try_borrow_mut() {
+        Ok(mut pages) => {
+            let now = writes_into(start, end, true, &mut pages)?;
+            Some(use_pages(now, &pages))
+        }
+        Err(_) => {
+            let (now, pages) = writes(start, end, true)?;
+            Some(use_pages(now, &pages))
+        }
+    })
+}
+
+/// [`writes`] into `out` (cleared first): returns the asking's number.
+fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -477,13 +510,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        out.clear();
+        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        return Some(j.ahead_asked);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -551,17 +580,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = pages_and_parts(&j.found[..count]).into_iter().chain(guarded.into_iter().map(|page| (page, WHOLE)));
-    for (page, parts) in pages.collect::<Vec<_>>() {
-        j.note(page, parts, now);
+    note_found(j, count, now);
+    for page in guarded {
+        j.note(page, WHOLE, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    out.clear();
+    out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    Some(now)
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -687,10 +712,11 @@ impl Guards {
     }
 
     /// A write fault opened `block` ([`rest`]).
-    fn opened_now(&mut self, block: usize) {
+    fn opened_now(&mut self, block: usize, rest: std::time::Duration) {
         const MANY: usize = 1 << 13;
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            // Only blocks whose rest is over: a longer rest keeps its own.
+            self.opened.retain(|_, at| at.elapsed() < rest);
         }
         self.opened.insert(block, std::time::Instant::now());
     }
@@ -732,7 +758,37 @@ fn rest() -> std::time::Duration {
 /// ... views left read-only").
 fn open_one_view() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if ONE_VIEW_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
     *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`open_one_view`] on for this thread (faults are handled on
+    /// the faulting thread).
+    static ONE_VIEW_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`open_one_view`]: before guarded `block` is noted clean, the views
+/// of its pages a fault left writable are made read-only again, or a later
+/// write through them would fault nothing and the block would stay clean.
+/// False if one of them could not be (then the block stays not clean).
+fn rearm_aliases(g: &mut Guards, block: usize) -> bool {
+    if !open_one_view() || !g.aliased.contains(&block) {
+        return true;
+    }
+    let mut all = true;
+    for alias in crate::inplace::pages_of(block * BLOCK) {
+        let alias = alias / BLOCK;
+        if alias != block && g.aliased.contains(&alias) && !g.protected.contains(&alias) {
+            protect_alias(g, alias);
+            all &= g.protected.contains(&alias);
+        }
+    }
+    all
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -1022,7 +1078,9 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                if rearm_aliases(&mut g, block) {
+                    g.clean.insert(block);
+                }
             } else if g.rests(block, rest) {
                 // Just written by the title: left open, written again next
                 // time.
@@ -1266,7 +1324,7 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
         open(g, at, at + 1)
     };
     if opened && !rest().is_zero() {
-        g.opened_now(block);
+        g.opened_now(block, rest());
     }
     opened
 }
@@ -1601,7 +1659,7 @@ mod rest_tests {
             opened: BTreeMap::new(),
         };
         let rest = std::time::Duration::from_secs(60);
-        g.opened_now(5);
+        g.opened_now(5, rest);
         assert!(g.rests(5, rest));
         assert!(!g.rests(6, rest));
         // Off: nothing rests.
@@ -1609,6 +1667,13 @@ mod rest_tests {
         // Over: not any more.
         g.opened.insert(7, std::time::Instant::now() - std::time::Duration::from_millis(5));
         assert!(!g.rests(7, std::time::Duration::from_millis(3)));
+        // Pruned when many against the rest set, not a fixed 50 ms.
+        let old = std::time::Instant::now() - std::time::Duration::from_millis(100);
+        g.opened.extend((100..100 + (1 << 13)).map(|block| (block, old)));
+        g.opened_now(9, rest);
+        assert!(g.rests(100, rest));
+        g.opened_now(10, std::time::Duration::from_millis(50));
+        assert!(!g.opened.contains_key(&100));
     }
 }
 
@@ -1644,6 +1709,12 @@ mod parts_tests {
         // A page first named in part: what was not named was not written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+        // Kernel answers stream in: each page once, only the first `count`.
+        j.found = vec![20 * PAGE, 20 * PAGE + KERNEL_PAGE, 21 * PAGE, 30 * PAGE];
+        note_found(&mut j, 3, 10);
+        assert_eq!(j.written.get(&20), Some(&10));
+        assert_eq!(j.written.get(&21), Some(&10));
+        assert_eq!(j.written.get(&30), None);
     }
 }
 
@@ -1678,6 +1749,13 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // The reused answer buffer holds this asking's pages only.
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write(1) };
+        let (third, pages) = with_writes(start, end, |n, w| (n, w.to_vec())).expect("watched");
+        assert_eq!(pages, [(p / PAGE + 1, now), (p / PAGE + 3, third)]);
+        let pages = with_writes(p, p + PAGE, |_, w| w.to_vec()).expect("watched");
+        assert!(pages.is_empty());
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -2143,6 +2221,30 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// With `VICTORY_OPEN_ONE_VIEW`: a write through one view opens it and
+    /// leaves the other not clean; the other's check must make the first
+    /// read-only again before it notes itself clean, or a second write
+    /// through the first faults nothing and the other's copy goes stale.
+    #[test]
+    fn one_view_writes_twice_with_a_check_of_the_other_between() {
+        const SIZE: usize = BLOCK;
+        ONE_VIEW_HERE.with(|on| on.set(true));
+        let (section, a, b) = two_views(SIZE);
+        let page = b / PAGE;
+        assert_eq!(guard(a, a + SIZE), Some(vec![a / PAGE]));
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]), "guarded with a, not yet taken");
+        assert_eq!(guard(b, b + SIZE), Some(Vec::new()), "nothing written yet");
+        // SAFETY: view a, read-write once the handler has opened it.
+        unsafe { ((a + 8) as *mut u8).write(1) };
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]));
+        // SAFETY: as above; it must fault again.
+        unsafe { ((a + 16) as *mut u8).write(2) };
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]), "the second write is seen too");
+        assert_eq!(guard(b, b + SIZE), Some(Vec::new()));
+        ONE_VIEW_HERE.with(|on| on.set(false));
+        drop_views(section, &[a, b], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

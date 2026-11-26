@@ -2738,6 +2738,37 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
+/// A piece of a copy-back: the copy, its bytes `[lo, hi)`, where they go in
+/// the fetch buffer.
+type RelayPiece<T> = (std::sync::Arc<T>, usize, usize, u64);
+
+/// Whether the copy-back records pieces that are contiguous in both the
+/// copy and the fetch buffer as one `CopyBufferRegion`
+/// (`VICTORY_RELAY_COPY_RUNS=1`; off by default: one call per piece, as
+/// before). After kelvaroq native/patches/0032. Only the card's calls are
+/// joined: the pieces stay as they are for the CPU's merge and checks. The
+/// frame log counts the calls joined ("copy-back copies joined").
+fn relay_copy_runs_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// `pieces` as copies to record (copy, `[lo, hi)`, where in the fetch
+/// buffer): with `join`, runs of pieces of one copy contiguous in it and in
+/// the fetch buffer as one.
+fn relay_copy_runs<T>(pieces: &[RelayPiece<T>], join: bool) -> impl Iterator<Item = (&T, usize, usize, u64)> {
+    pieces
+        .chunk_by(move |left, right| {
+            join && std::sync::Arc::ptr_eq(&left.0, &right.0)
+                && left.2 == right.1
+                && left.3.checked_add((left.2 - left.1) as u64) == Some(right.3)
+        })
+        .map(|run| {
+            let (shadow, lo, _, at) = &run[0];
+            (shadow.as_ref(), *lo, run[run.len() - 1].2, *at)
+        })
+}
+
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
@@ -2808,6 +2839,34 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 #[cfg(test)]
 mod relay_tests {
     use super::{fetched_beside, flagged_pieces, landable, note_beside};
+
+    #[test]
+    fn joined_copy_back_keeps_bytes_order_holes_and_copies_apart() {
+        use std::sync::Arc;
+        let first = Arc::new([1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let second = Arc::new([11u8, 12, 13, 14, 15, 16, 17, 18]);
+        let pieces = [
+            (first.clone(), 0, 2, 0),
+            (first.clone(), 2, 4, 2),
+            (second.clone(), 4, 6, 4),
+            (second.clone(), 6, 7, 8),
+            (second.clone(), 0, 2, 9),
+            (first.clone(), 3, 5, 0),
+        ];
+        for (join, calls) in [(false, 6), (true, 5)] {
+            let mut bytes = [0xff; 11];
+            let mut count = 0;
+            for (source, lo, hi, at) in super::relay_copy_runs(&pieces, join) {
+                let at = at as usize;
+                bytes[at..at + hi - lo].copy_from_slice(&source[lo..hi]);
+                count += 1;
+            }
+            assert_eq!(count, calls);
+            assert_eq!(bytes, [4, 5, 3, 4, 15, 16, 0xff, 0xff, 17, 11, 12]);
+        }
+        let overflow = [(first.clone(), 0, 1, u64::MAX), (first, 1, 2, 0)];
+        assert_eq!(super::relay_copy_runs(&overflow, true).count(), 2);
+    }
 
     /// A piece fetched on the copy queue while a later flight was in the
     /// air is fetched again by that flight, and by no flight sent after
@@ -5159,7 +5218,7 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut pieces: Vec<RelayPiece<crate::shadow::Shadow>> = Vec::new();
         let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
@@ -5246,6 +5305,11 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let join = relay_copy_runs_on();
+        if join {
+            let calls = relay_copy_runs(&pieces, true).count();
+            crate::framelog::add(crate::framelog::T::RelayRunsJoined, (pieces.len() - calls) as u64);
+        }
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -5260,8 +5324,8 @@ impl Host {
                     // title's either way.
                     let after = second.order_done();
                     let copy = second.down.list()?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    for (shadow, lo, hi, at) in relay_copy_runs(&pieces, join) {
+                        copy.1.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
                     second.down.wait(job, event)?;
@@ -5280,8 +5344,8 @@ impl Host {
                 }
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in relay_copy_runs(&pieces, join) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];

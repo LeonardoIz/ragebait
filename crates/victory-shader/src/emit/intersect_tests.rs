@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{RESIDENT_BOXES, TEST_MEMORY};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -687,4 +687,74 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+/// With the switch, the program reads the directory's copy numbers; off,
+/// it lowers as it did (the switch is only read, nothing else changes).
+#[test]
+fn resident_boxes_change_the_translation_only_when_on() {
+    let before = RESIDENT_BOXES.get();
+    for wide in [true, false] {
+        RESIDENT_BOXES.set(false);
+        let off = build(wide, WHOLE).expect("lowers").0.dxil;
+        RESIDENT_BOXES.set(true);
+        let on = build(wide, WHOLE).expect("lowers and validates with the switch").0.dxil;
+        RESIDENT_BOXES.set(false);
+        assert_ne!(off, on);
+        assert_eq!(build(wide, WHOLE).unwrap().0.dxil, off);
+    }
+    RESIDENT_BOXES.set(before);
+}
+
+/// A box node in a page the host has no copy of reads as zeros: a ray
+/// through the origin hits its zero-sized boxes and took the zero child
+/// pointers as children. With `VICTORY_BVH_RESIDENT_BOXES` it takes none.
+#[test]
+fn a_box_in_a_missing_page_has_no_children_with_resident_boxes() {
+    // Below the tests' title memory: a page without a copy.
+    let missing = BASE - 0x1_0000;
+    let mut data = vec![0u32; (NODES / 4) as usize];
+    for (t, kind) in [5u64, 4].into_iter().enumerate() {
+        let r = &mut data[t * (RECORD / 4) as usize..][..13];
+        let pointer = (missing >> 6) << 3 | kind;
+        (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
+        r[2] = 10f32.to_bits();
+        for a in 0..3 {
+            r[6 + a] = 1f32.to_bits();
+            r[9 + a] = 1f32.to_bits();
+        }
+        r[12] = 1;
+    }
+    let _memory = Memory::at(BASE);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (on, want) in [(false, [0; 4]), (true, [bvh::NONE; 4])] {
+        let before = RESIDENT_BOXES.replace(on);
+        let (shader, _) = build(true, WHOLE).expect("the program lowers");
+        RESIDENT_BOXES.set(before);
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for t in 0..2 {
+                assert_eq!(out[0][4 * t..4 * t + 4], want, "{label}, switch {on}, thread {t}");
+            }
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }
