@@ -693,10 +693,11 @@ impl Guards {
     }
 
     /// A write fault opened `block` ([`rest`]).
-    fn opened_now(&mut self, block: usize) {
+    fn opened_now(&mut self, block: usize, rest: std::time::Duration) {
         const MANY: usize = 1 << 13;
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            // Only blocks whose rest is over: a longer rest keeps its own.
+            self.opened.retain(|_, at| at.elapsed() < rest);
         }
         self.opened.insert(block, std::time::Instant::now());
     }
@@ -1304,7 +1305,7 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
         open(g, at, at + 1)
     };
     if opened && !rest().is_zero() {
-        g.opened_now(block);
+        g.opened_now(block, rest());
     }
     opened
 }
@@ -1639,7 +1640,7 @@ mod rest_tests {
             opened: BTreeMap::new(),
         };
         let rest = std::time::Duration::from_secs(60);
-        g.opened_now(5);
+        g.opened_now(5, rest);
         assert!(g.rests(5, rest));
         assert!(!g.rests(6, rest));
         // Off: nothing rests.
@@ -1647,6 +1648,13 @@ mod rest_tests {
         // Over: not any more.
         g.opened.insert(7, std::time::Instant::now() - std::time::Duration::from_millis(5));
         assert!(!g.rests(7, std::time::Duration::from_millis(3)));
+        // Pruned when many against the rest set, not a fixed 50 ms.
+        let old = std::time::Instant::now() - std::time::Duration::from_millis(100);
+        g.opened.extend((100..100 + (1 << 13)).map(|block| (block, old)));
+        g.opened_now(9, rest);
+        assert!(g.rests(100, rest));
+        g.opened_now(10, std::time::Duration::from_millis(50));
+        assert!(!g.opened.contains_key(&100));
     }
 }
 
