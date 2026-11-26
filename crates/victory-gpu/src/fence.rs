@@ -97,6 +97,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
+        // A null event means "block until reached" (`VICTORY_FENCE_WAIT`):
+        // an event of ours waits with the title's, registered under the
+        // lock the value was read under.
+        #[cfg(windows)]
+        let blocking = fence_wait().then(|| latch(&mut waiters, value)).flatten();
         drop(waiters);
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
@@ -104,14 +109,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
+            if blocking.is_none() && fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
         }
-        // A null event means "block until reached".
         #[cfg(windows)]
-        if fence_wait() {
-            if block_until(fence, value) {
+        if let Some(latch) = blocking {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            if block_until(fence, value, latch, deadline) {
                 return S_OK;
             }
             tracing::warn!(value, "blocking fence wait timed out");
@@ -137,34 +142,47 @@ fn fence_wait() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_FENCE_WAIT").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// Waits until the fence is at `value`, 250 ms at most: woken by [`set`],
-/// and every 10 ms running the queues' held lists (a signal may be behind
-/// them). Whether it got there.
+/// A manual-reset event of ours for a blocking wait for `value`, among
+/// the fence's waiters (whose lock the caller holds): [`set`] sets it as it
+/// does the title's, so a wait sees the value reached even if the fence is
+/// moved back before it looks.
 #[cfg(windows)]
-fn block_until(fence: &Fence, value: u64) -> bool {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        let current = fence.value.load(Ordering::Acquire);
-        if current >= value {
-            return true;
+fn latch(waiters: &mut Vec<(u64, usize)>, value: u64) -> Option<usize> {
+    // SAFETY: a plain manual-reset event, not signalled.
+    let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        tracing::warn!("no event for a blocking fence wait");
+        return None;
+    }
+    waiters.push((value, event as usize));
+    Some(event as usize)
+}
+
+/// Waits until [`set`] reached `value` (`latch`, from [`latch`]), until
+/// `deadline` at most, every 10 ms running the queues' held lists (a
+/// signal may be behind them). Whether it got there; `latch` is gone
+/// afterwards.
+#[cfg(windows)]
+fn block_until(fence: &Fence, value: u64, latch: usize, deadline: std::time::Instant) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let reached = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // SAFETY: our event, closed only below.
+        let set = unsafe { WaitForSingleObject(latch as *mut c_void, (left.as_millis() as u32).min(10)) } == WAIT_OBJECT_0;
+        if set || fence.value.load(Ordering::Acquire) >= value {
+            break true;
         }
-        let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return false;
-        }
-        // SAFETY: compares the fence's value with `current`, both 8 bytes
-        // that live through the call.
-        unsafe {
-            windows_sys::Win32::System::Threading::WaitOnAddress(
-                (&raw const fence.value).cast(),
-                (&raw const current).cast(),
-                size_of::<u64>(),
-                (left.as_millis() as u32).clamp(1, 10),
-            );
+            break false;
         }
         crate::queue::release_held(false);
-    }
+    };
+    // Under the lock, so `set` no longer sets it once closed.
+    fence.waiters.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.1 != latch);
+    // SAFETY: ours, no longer among the waiters.
+    unsafe { CloseHandle(latch as *mut c_void) };
+    reached
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
@@ -180,14 +198,6 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
-    drop(waiters);
-    // Threads waiting on the value's address ([`block_until`], or the
-    // title's own `WaitOnAddress` on the fence's GPU address) wake now.
-    #[cfg(windows)]
-    // SAFETY: only names the address.
-    unsafe {
-        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
-    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -424,13 +434,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             set(at as This, 3);
         });
+        let wait = |value: u64| {
+            let latch = latch(&mut fence(f).waiters.lock().unwrap(), value).unwrap();
+            block_until(fence(f), value, latch, std::time::Instant::now() + std::time::Duration::from_millis(250))
+        };
         let started = std::time::Instant::now();
-        assert!(block_until(fence(f), 3));
+        assert!(wait(3));
         assert!(started.elapsed() < std::time::Duration::from_millis(240), "woken, not timed out");
         setter.join().unwrap();
         let started = std::time::Instant::now();
-        assert!(!block_until(fence(f), 4));
+        assert!(!wait(4));
         assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        assert!(fence(f).waiters.lock().unwrap().is_empty(), "the waits' events are gone");
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// `VICTORY_FENCE_WAIT`: a wait sees its value reached even when the
+    /// fence is moved back before the waiting thread looks.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_sees_a_value_set_and_moved_back() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let latch = latch(&mut fence(f).waiters.lock().unwrap(), 5).unwrap();
+        set(f, 5);
+        set(f, 4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        assert!(block_until(fence(f), 5, latch, deadline));
+        assert!(std::time::Instant::now() < deadline, "woken, not timed out");
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
