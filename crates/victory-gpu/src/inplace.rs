@@ -657,10 +657,8 @@ impl Rig {
             self.done += 1;
             let waited = self.queue.Signal(&self.fence, self.done)
                 .and_then(|()| crate::host::wait_for_fence(&self.device, &self.fence, self.done, self.event));
-            if let Err(e) = waited {
-                crate::host::fail(format_args!("an in-place memory probe submission could not finish ({e})"));
-            }
-            Ok(())
+            // A diagnostic probe: report the failure as one of its lines, as before.
+            waited
         }
     }
 

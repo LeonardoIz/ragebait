@@ -8,13 +8,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -448,28 +448,38 @@ fn poll_fence(
     Ok(())
 }
 
-/// Waits for a value already signalled on the queue. An event failure or
-/// an early wake falls back to polling. Only device removal ends that wait.
+/// Waits for a value already signalled on the queue, in one-second slices
+/// that re-check the fence and the device, so an early wake or a lost
+/// signal costs at most a slice and a wait that never ends is logged. An
+/// event failure falls back to polling. Only device removal ends the wait.
 pub(crate) fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, target: u64, event: HANDLE) -> windows::core::Result<()> {
+    static EVENT_FAILED: std::sync::Once = std::sync::Once::new();
+    static LONG_WAIT: std::sync::Once = std::sync::Once::new();
+    let began = std::time::Instant::now();
     // SAFETY: the device and its fence are live; callers own or serialize
     // access to the event.
     unsafe {
-        let completed = fence.GetCompletedValue();
-        if fence_reached(completed, target) {
-            return Ok(());
-        }
-        if completed != u64::MAX {
-            match fence.SetEventOnCompletion(target, event) {
+        loop {
+            let completed = fence.GetCompletedValue();
+            if fence_reached(completed, target) {
+                return Ok(());
+            }
+            device.GetDeviceRemovedReason()?;
+            if began.elapsed() >= std::time::Duration::from_secs(10) {
+                LONG_WAIT.call_once(|| tracing::warn!(target, completed, "a fence wait has gone on for over 10 s with the device healthy"));
+            }
+            let failed = match fence.SetEventOnCompletion(target, event) {
                 Ok(()) => {
-                    let waited = WaitForSingleObject(event, INFINITE);
-                    if waited != WAIT_OBJECT_0 {
-                        tracing::warn!(status = waited.0, target, "fence event wait failed; polling instead");
-                    }
+                    let waited = WaitForSingleObject(event, 1000);
+                    (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(|| format!("wait status {}", waited.0))
                 }
-                Err(e) => tracing::warn!(error = %e, target, "fence event setup failed; polling instead"),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(why) = failed {
+                EVENT_FAILED.call_once(|| tracing::warn!(target, why, "fence event failed; polling instead (logged once)"));
+                return poll_fence(target, || fence.GetCompletedValue(), || device.GetDeviceRemovedReason());
             }
         }
-        poll_fence(target, || fence.GetCompletedValue(), || device.GetDeviceRemovedReason())
     }
 }
 
