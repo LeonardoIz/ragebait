@@ -18,12 +18,8 @@ pub(crate) fn eviction_enabled() -> bool {
 
 const HEADROOM: u64 = 32 << 20;
 const MAX_VICTIMS: usize = 128;
-static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
-
 /// Recording threads can request a trim without taking the submission lock.
-pub(super) fn request_after_oom() {
-    ALLOCATION_FAILED.store(true, Relaxed);
-}
+static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The explicit texture cap is independent of the adapter's overall budget.
 fn pressure(video: Option<[u64; 4]>, filled: u64, cap: Option<u64>) -> (u64, u64) {
@@ -46,48 +42,106 @@ struct Candidate {
     address: usize,
 }
 
-fn candidate(
+/// Pure part of [`cold`]: the state a recorder sees under `made`'s lock.
+/// Selection and the revalidation after relocking compare its result.
+fn cold_state(
     address: usize,
     used: u64,
+    filled: bool,
     idle: bool,
     owners: usize,
     references: u32,
 ) -> Option<Candidate> {
-    (idle && owners == 1 && references == 1).then_some(Candidate { used, address })
+    (filled && idle && owners == 1 && references == 1).then_some(Candidate { used, address })
 }
 
 fn cold(address: usize, resource: &Resource, host: &Arc<HostTexture>) -> Option<Candidate> {
     let used = resource.host.used.load(Relaxed);
-    let owners = Arc::strong_count(host);
-    if !host.filled || !crate::host::long_ago(used, 1_000, 4) || owners != 1 {
-        return None;
-    }
-    candidate(
+    cold_state(
         address,
         used,
-        true,
-        owners,
+        host.filled,
+        crate::host::long_ago(used, 1_000, 4),
+        Arc::strong_count(host),
         crate::host::references(&host.texture),
     )
 }
 
 /// The caller holds the title-memory reading guard through removal.
 pub(super) fn reloadable(address: usize, resource: &Resource) -> bool {
+    let texture = std::cell::OnceCell::new();
+    let layout = || texture.get_or_init(|| texture_layout(&resource.desc));
+    may_reload(
+        resource.desc.sample_count,
+        resource.heap_flags,
+        || crate::texture::has_host_contents(address),
+        || {
+            layout()
+                .as_ref()
+                .map(|t| (t.planes.len(), t.planes[0].layout.desc.swizzle.xor()))
+        },
+        || {
+            layout().as_ref().is_some_and(|t| {
+                crate::texture::committed(
+                    resource.data().cast_const(),
+                    t.planes[0].layout.size as usize,
+                )
+            })
+        },
+    )
+}
+
+/// Pure part of [`reloadable`]: only a copy whose contents title memory can
+/// give back in full. `host_contents` covers both a host copy/resolve write
+/// (`host_wrote`) and an alias copy (`THROUGH`); `layout` is the plane count
+/// and whether plane 0 uses an XOR swizzle. The checks run in this order.
+fn may_reload(
+    sample_count: u32,
+    heap_flags: u32,
+    host_contents: impl FnOnce() -> bool,
+    layout: impl FnOnce() -> Option<(usize, bool)>,
+    committed: impl FnOnce() -> bool,
+) -> bool {
     const ALLOW_DISPLAY: u32 = 8;
-    if resource.desc.sample_count > 1
-        || resource.heap_flags & ALLOW_DISPLAY != 0
-        || crate::texture::has_host_contents(address)
-    {
-        return false;
-    }
-    texture_layout(&resource.desc).is_some_and(|texture| {
-        texture.planes.len() == 1
-            && !texture.planes[0].layout.desc.swizzle.xor()
-            && crate::texture::committed(
-                resource.data().cast_const(),
-                texture.planes[0].layout.size as usize,
-            )
+    sample_count <= 1
+        && heap_flags & ALLOW_DISPLAY == 0
+        && !host_contents()
+        && layout() == Some((1, false))
+        && committed()
+}
+
+/// Whether a host copy may be made now: `retry_at` is 0 or has passed.
+pub(super) fn may_retry(retry_at: u64, now_ms: u64) -> bool {
+    retry_at == 0 || now_ms >= retry_at
+}
+
+/// After a failed host creation with eviction `enabled`: the time of the
+/// next try for a transient out-of-memory error on a filled texture (and a
+/// trim is requested), or `None` for a permanent refusal.
+pub(super) fn retry_at(
+    enabled: bool,
+    out_of_memory: bool,
+    filled: bool,
+    now_ms: u64,
+) -> Option<u64> {
+    (enabled && out_of_memory && filled).then(|| {
+        ALLOCATION_FAILED.store(true, Relaxed);
+        now_ms + 1_000
     })
+}
+
+/// A new host copy of a texture evicted under pressure must be uploaded
+/// again from title memory before it is read.
+pub(super) fn carry_eviction(evicted: &AtomicBool, reupload: &AtomicBool) {
+    if evicted.swap(false, Relaxed) {
+        reupload.store(true, Relaxed);
+    }
+}
+
+/// When a submitted upload of a replacement copy runs (`defer_host`):
+/// clears the copy's flag, true the first time.
+pub(crate) fn reuploaded(reupload: &AtomicBool) -> bool {
+    reupload.swap(false, Relaxed)
 }
 
 /// Call under the host submission lock after the previous fence has
@@ -172,7 +226,11 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, HEADROOM, candidate, pressure};
+    use super::{
+        ALLOCATION_FAILED, Candidate, HEADROOM, carry_eviction, cold_state, may_reload, may_retry,
+        pressure, retry_at, reuploaded,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
     #[test]
     fn pressure_respects_both_budgets() {
@@ -193,33 +251,80 @@ mod tests {
     #[test]
     fn selects_oldest_idle_copies_without_list_or_descriptor_references() {
         let mut victims = [
-            candidate(1, 10, false, 1, 1),
-            candidate(2, 1, true, 2, 1),
-            candidate(3, 2, true, 1, 2),
-            candidate(4, 9, true, 1, 1),
-            candidate(5, 3, true, 1, 1),
-            candidate(6, 3, true, 1, 1),
+            cold_state(1, 10, true, false, 1, 1),
+            cold_state(2, 1, true, true, 2, 1),
+            cold_state(3, 2, true, true, 1, 2),
+            cold_state(7, 0, false, true, 1, 1),
+            cold_state(4, 9, true, true, 1, 1),
+            cold_state(5, 3, true, true, 1, 1),
+            cold_state(6, 3, true, true, 1, 1),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
         victims.sort_unstable();
-        assert_eq!(
-            victims,
-            [
-                Candidate {
-                    used: 3,
-                    address: 5
-                },
-                Candidate {
-                    used: 3,
-                    address: 6
-                },
-                Candidate {
-                    used: 9,
-                    address: 4
-                },
-            ]
-        );
+        let at = |used, address| Candidate { used, address };
+        assert_eq!(victims, [at(3, 5), at(3, 6), at(9, 4)]);
+    }
+
+    #[test]
+    fn revalidation_after_relocking_drops_copies_used_or_pinned_since() {
+        let selected = cold_state(5, 3, true, true, 1, 1).unwrap();
+        // Unchanged: still evicted.
+        assert_eq!(cold_state(5, 3, true, true, 1, 1), Some(selected));
+        // Asked for again since (a newer `used`, recent or not).
+        assert_ne!(cold_state(5, 4, true, true, 1, 1), Some(selected));
+        assert_ne!(cold_state(5, 4, true, false, 1, 1), Some(selected));
+        // A list holds an Arc, or a descriptor slot a COM reference.
+        assert_ne!(cold_state(5, 3, true, true, 2, 1), Some(selected));
+        assert_ne!(cold_state(5, 3, true, true, 1, 2), Some(selected));
+    }
+
+    #[test]
+    fn only_copies_title_memory_gives_back_whole_are_reloadable() {
+        let ok = |samples, flags, host, layout, committed| {
+            may_reload(samples, flags, || host, || layout, || committed)
+        };
+        assert!(ok(1, 0, false, Some((1, false)), true));
+        // A host copy, resolve or alias copy (`host_wrote`, `THROUGH`).
+        assert!(!ok(1, 0, true, Some((1, false)), true));
+        assert!(!ok(4, 0, false, Some((1, false)), true));
+        assert!(!ok(1, 8, false, Some((1, false)), true));
+        assert!(!ok(1, 0, false, Some((2, false)), true));
+        assert!(!ok(1, 0, false, Some((1, true)), true));
+        assert!(!ok(1, 0, false, None, true));
+        assert!(!ok(1, 0, false, Some((1, false)), false));
+        // Host contents are excluded before the layout or memory is read.
+        assert!(!may_reload(
+            1,
+            0,
+            || true,
+            || panic!("layout read"),
+            || panic!("memory read")
+        ));
+    }
+
+    #[test]
+    fn evicted_copy_is_reuploaded_once_and_retries_wait_after_out_of_memory() {
+        let (evicted, reupload) = (AtomicBool::new(true), AtomicBool::new(false));
+        carry_eviction(&evicted, &reupload);
+        assert!(!evicted.load(Relaxed) && reupload.load(Relaxed));
+        // The submitted upload's `defer_host` clears it, counted once.
+        assert!(reuploaded(&reupload));
+        assert!(!reuploaded(&reupload));
+        // A copy made again without an eviction needs no reupload.
+        carry_eviction(&evicted, &reupload);
+        assert!(!reupload.load(Relaxed));
+
+        assert!(may_retry(0, 5));
+        assert!(!may_retry(1_005, 1_004));
+        assert!(may_retry(1_005, 1_005));
+        assert_eq!(retry_at(false, true, true, 5), None);
+        assert!(!ALLOCATION_FAILED.load(Relaxed));
+        assert_eq!(retry_at(true, false, true, 5), None);
+        assert_eq!(retry_at(true, true, false, 5), None);
+        assert!(!ALLOCATION_FAILED.load(Relaxed));
+        assert_eq!(retry_at(true, true, true, 5), Some(1_005));
+        assert!(ALLOCATION_FAILED.swap(false, Relaxed));
     }
 }

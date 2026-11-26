@@ -821,7 +821,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
-            if replacement.as_ref().is_some_and(|copy| copy.reupload.swap(false, Relaxed)) {
+            if replacement.as_ref().is_some_and(|copy| crate::resource::reuploaded(&copy.reupload)) {
                 crate::framelog::add(crate::framelog::T::VramReuploads, 1);
             }
         });
