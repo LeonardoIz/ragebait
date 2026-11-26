@@ -2930,12 +2930,24 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
+    /// Heap worker uploads, kept with the flight until its fence completes.
+    uploads: Vec<HostList>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
     /// Title-memory ranges written when its shader textures are copied back.
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+}
+
+impl Sent {
+    fn keep_uploads(&mut self, lists: &mut Vec<crate::list::Detached>, order: &mut Vec<usize>) {
+        if !self.uploads.is_empty() {
+            let first = lists.len();
+            order.splice(0..0, first..first + self.uploads.len());
+            lists.extend(self.uploads.drain(..).map(crate::list::Detached::ours));
+        }
+    }
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2945,6 +2957,8 @@ struct Flight {
     number: u64,
     /// The value signalled on the host's fence behind it.
     fence: u64,
+    /// All lists sent, including a present list the caller keeps.
+    count: usize,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
@@ -5532,7 +5546,7 @@ impl Host {
             let mut ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
+                    *lists += flight.count;
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
@@ -5719,24 +5733,17 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
-        // Textures uploaded ahead (`crate::heap_worker`): their lists run
-        // before the title's.
-        let ahead = crate::heap_worker::take_ready();
-        if !ahead.is_empty() {
-            let first = lists.len();
-            order.splice(0..0, first..first + ahead.len());
-            lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
-        }
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)
         };
-        let Some((mut submitted, sent)) = sent else {
+        let Some((mut submitted, mut sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
         };
+        sent.keep_uploads(&mut lists, &mut order);
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -5753,6 +5760,7 @@ impl Host {
             items.push(Late::Run(Flight {
                 number: sent.number,
                 fence: *target,
+                count: order.len(),
                 lists,
                 order,
                 card: sent.card,
@@ -5785,10 +5793,12 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], true) else {
+        let Some((submitted, mut sent)) = self.submit(&[list], true) else {
             return 0;
         };
         let number = sent.number;
+        let (mut lists, mut order) = (Vec::new(), Vec::new());
+        sent.keep_uploads(&mut lists, &mut order);
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -5799,13 +5809,14 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
-            *flying += 1;
+            *flying += 1 + order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number,
                 fence: *target,
-                lists: Vec::new(),
-                order: Vec::new(),
+                count: 1 + order.len(),
+                lists,
+                order,
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -5978,6 +5989,16 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Publish ready texture descriptors under the same lock that sends
+        // their upload lists ahead of any draws that can read those slots.
+        let uploads = if late { crate::heap_worker::take_ready() } else { Vec::new() };
+        let with_uploads;
+        let runs = if uploads.is_empty() {
+            runs
+        } else {
+            with_uploads = uploads.iter().chain(runs.iter().copied()).collect::<Vec<_>>();
+            &with_uploads
+        };
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6138,6 +6159,7 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
+                uploads,
                 card,
                 back,
                 texture_back_ranges,
