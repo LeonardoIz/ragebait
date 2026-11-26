@@ -2730,14 +2730,6 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
-/// For one plan of copies in the card's memory, with [`relay`]: `flags`
-/// holds, for every piece of every range of the plan, the copy, the
-/// piece's number in the copy and whether the compare flagged it there (or
-/// did not run). The pieces to fetch, under whichever range: all of them
-/// flagged under any. Two ranges of a plan may hold parts of the same
-/// 64 KiB piece; the compare hashes the whole piece for each and stores
-/// the hash, so the second of them may find it stored already and not
-/// flag it.
 /// A piece of a copy-back: the copy, its bytes `[lo, hi)`, where they go in
 /// the fetch buffer.
 type RelayPiece<T> = (std::sync::Arc<T>, usize, usize, u64);
@@ -2769,6 +2761,14 @@ fn relay_copy_runs<T>(pieces: &[RelayPiece<T>], join: bool) -> impl Iterator<Ite
         })
 }
 
+/// For one plan of copies in the card's memory, with [`relay`]: `flags`
+/// holds, for every piece of every range of the plan, the copy, the
+/// piece's number in the copy and whether the compare flagged it there (or
+/// did not run). The pieces to fetch, under whichever range: all of them
+/// flagged under any. Two ranges of a plan may hold parts of the same
+/// 64 KiB piece; the compare hashes the whole piece for each and stores
+/// the hash, so the second of them may find it stored already and not
+/// flag it.
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }

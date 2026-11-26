@@ -4113,7 +4113,9 @@ impl Shadow {
             bits.resize(pages.div_ceil(64), 0);
         }
         *left += note_pages(bits, first, start + from, start + to);
-        self.landing.store(true, Ordering::Release);
+        if *left > 0 {
+            self.landing.store(true, Ordering::Release);
+        }
     }
 
     /// [`Shadow::copy`] of `[from, to)` (inside the buffer) with

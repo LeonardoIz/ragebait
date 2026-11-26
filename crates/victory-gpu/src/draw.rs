@@ -3231,7 +3231,8 @@ impl State {
             victory_shader::emit::spread_groups(group_x, group_y, group_z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
-        } else if !groups_fit([gx, gy, gz]) {
+        }
+        if !groups_fit([gx, gy, gz]) {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
             // A thread-count dispatch the host cannot take (a spilled
             // builder stage has no spread prologue) is a dropped stage.

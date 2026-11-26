@@ -1274,7 +1274,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        let same = same_records() && same_slots(dst, src, count, step, kind);
+        let same = same_records() && step != 0 && same_slots(dst, src, count, step, kind);
         if same {
             #[cfg(windows)]
             crate::framelog::add(crate::framelog::T::SameRecords, 1);
