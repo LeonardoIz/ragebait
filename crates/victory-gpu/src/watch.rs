@@ -33,6 +33,80 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// The parts of a page the kernel can name.
+const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All of them.
+const WHOLE: u16 = u16::MAX;
+
+/// Whether the 4 KiB parts of a page the kernel names as written are kept,
+/// and a refresh copies (and sends up) only those parts of a page it took
+/// before (`VICTORY_PAGE_PARTS=1`; off by default: the 64 KiB page, as
+/// before). After cgbj 3ead56e.
+///
+/// The kernel says which 4 KiB pages were written, and a refresh took the
+/// 64 KiB around each: cgbj measured 29 MB a frame written so in 114 MB
+/// copied, and as much sent up to the card and hashed again there. What is
+/// asked and checked stays a page; what the guards answer (view memory) is
+/// a whole page still. Its effect is in the frame log ("refresh parts").
+pub(crate) fn parts_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_some_and(|v| v == "1"))
+}
+
+impl Journal {
+    /// Page `page` was found written by asking `now`, in the parts `parts`
+    /// (a bit each). Returns the asking that found it written before (0:
+    /// never).
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let before = self.written.insert(page, now).unwrap_or(0);
+        if parts == WHOLE {
+            if !self.parts.is_empty() {
+                self.parts.remove(&page);
+            }
+            return before;
+        }
+        let all = self.parts.entry(page).or_insert([before; PARTS]);
+        for (k, at) in all.iter_mut().enumerate() {
+            if parts >> k & 1 != 0 {
+                *at = now;
+            }
+        }
+        before
+    }
+
+    /// The parts of `page` written by an asking after `taken` (all of them
+    /// for a page never taken).
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        match self.parts.get(&page) {
+            Some(all) if taken != 0 => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
+            _ => WHOLE,
+        }
+    }
+}
+
+/// Of pages a copy took before (page number, the asking it took the page
+/// at): the parts written since, a bit for each 4 KiB, in the same order.
+pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+}
+
+/// Kernel answers (addresses of written 4 KiB pages, in order) as 64 KiB
+/// pages, each once, with their written parts (all of them without
+/// [`parts_on`]).
+fn pages_and_parts(found: &[usize]) -> Vec<(usize, u16)> {
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    let on = parts_on();
+    for &at in found {
+        let (page, part) = (at / PAGE, if on { 1u16 << (at % PAGE / KERNEL_PAGE) } else { WHOLE });
+        match pages.last_mut() {
+            Some((last, parts)) if *last == page => *parts |= part,
+            _ => pages.push((page, part)),
+        }
+    }
+    pages
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -59,6 +133,10 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// With [`parts_on`]: the same for each of a page's 4 KiB parts, for
+    /// pages the kernel named in part; a page that is not here was written
+    /// whole, as far as anyone knows.
+    parts: BTreeMap<usize, [u64; PARTS]>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -75,6 +153,7 @@ struct Journal {
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    parts: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -275,7 +354,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        j.note(page, WHOLE, now);
     }
 }
 
@@ -298,10 +377,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.note(page, WHOLE, now);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.note(other, WHOLE, now);
         }
     }
     (before, now)
@@ -365,9 +444,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+    for (page, parts) in pages_and_parts(&j.found[..count]) {
+        j.note(page, parts, now);
     }
     true
 }
@@ -473,9 +551,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    let pages = pages_and_parts(&j.found[..count]).into_iter().chain(guarded.into_iter().map(|page| (page, WHOLE)));
+    for (page, parts) in pages.collect::<Vec<_>>() {
+        j.note(page, parts, now);
     }
     Some((
         now,
@@ -597,6 +675,64 @@ struct Guards {
     /// With [`absent_once`]: for blocks of `absent`, when ([`guard_ms`])
     /// Windows last said they are uncommitted.
     verified: BTreeMap<usize, u64>,
+    /// With [`rest`]: blocks a write fault opened, and when.
+    opened: BTreeMap<usize, std::time::Instant>,
+}
+
+impl Guards {
+    /// Whether `block` is left open for now ([`rest`]): the title has just
+    /// written it.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault opened `block` ([`rest`]).
+    fn opened_now(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+}
+
+/// How long a block a write fault of the title's has just opened is left
+/// open by the askings that take it (`VICTORY_GUARD_REST=1`: 3 ms;
+/// `=<microseconds>`; unset or `0`: not at all, as before). After cgbj
+/// 7bc7c07.
+///
+/// cgbj counted 586 faults a frame, 220 of them within 3 ms of the asking
+/// that had made the block read-only while the title was still writing it:
+/// made read-only, written, opened, up to a dozen times a frame, each a
+/// change of protection under the guards' lock with other faults waiting.
+/// A block that rests is reported written at each asking, so nothing is
+/// missed; the first asking after its rest makes it read-only again. Its
+/// effect is in the frame log ("guards: ... rested").
+fn rest() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| match std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(1) => 3000,
+        Some(us) => us,
+        None => 0,
+    });
+    std::time::Duration::from_micros(us)
+}
+
+/// Whether a write fault opens only the view it came through, and leaves
+/// the page's other views read-only, noted as not clean any more
+/// (`VICTORY_OPEN_ONE_VIEW=1`; off by default: it opens them all, as
+/// before). After cgbj 7bc7c07.
+///
+/// The others were opened (a change of protection each, under the guards'
+/// lock) and made read-only again at their next asking, though the title
+/// wrote through one view only. Not clean, they are reported written at
+/// their next asking as before; a write through one of them faults and
+/// opens it. Their group stays noted (`Guards::aliased`), so that such a
+/// write still tells the others. Its effect is in the frame log ("guards:
+/// ... views left read-only").
+fn open_one_view() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -647,6 +783,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
+    opened: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -850,6 +987,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let rest = rest();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -885,6 +1023,10 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if g.rests(block, rest) {
+                // Just written by the title: left open, written again next
+                // time.
+                crate::framelog::add(crate::framelog::T::GuardRests, 1);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1103,6 +1245,30 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         }
     }
     any
+}
+
+/// [`open`] for a write fault of the title's at `at`, with [`rest`] and
+/// [`open_one_view`]; true if the block was guarded.
+fn open_fault(g: &mut Guards, at: usize) -> bool {
+    let block = at / BLOCK;
+    let opened = if open_one_view() {
+        let any = open_here(g, at, at + 1);
+        if any && g.aliased.contains(&block) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                if alias != block && g.clean.remove(&alias) {
+                    crate::framelog::add(crate::framelog::T::GuardViewsKept, 1);
+                }
+            }
+        }
+        any
+    } else {
+        open(g, at, at + 1)
+    };
+    if opened && !rest().is_zero() {
+        g.opened_now(block);
+    }
+    opened
 }
 
 /// [`open`] for one range, without the other views of its pages.
@@ -1388,7 +1554,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open_fault(&mut g, at) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
@@ -1417,6 +1583,68 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_just_opened_rests_and_others_do_not() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            verified: BTreeMap::new(),
+            opened: BTreeMap::new(),
+        };
+        let rest = std::time::Duration::from_secs(60);
+        g.opened_now(5);
+        assert!(g.rests(5, rest));
+        assert!(!g.rests(6, rest));
+        // Off: nothing rests.
+        assert!(!g.rests(5, std::time::Duration::ZERO));
+        // Over: not any more.
+        g.opened.insert(7, std::time::Instant::now() - std::time::Duration::from_millis(5));
+        assert!(!g.rests(7, std::time::Duration::from_millis(3)));
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn the_parts_of_a_page_written_since_it_was_taken() {
+        let mut j = Journal {
+            asked: 0,
+            written: BTreeMap::new(),
+            parts: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        assert_eq!(j.parts_since(7, 1), WHOLE);
+        assert_eq!(j.note(7, WHOLE, 3), 0);
+        // Parts 0 and 5 at 4, part 5 again at 6: taken at 2, all is due.
+        assert_eq!(j.note(7, 0b10_0001, 4), 3);
+        assert_eq!(j.note(7, 0b10_0000, 6), 4);
+        assert_eq!(j.parts_since(7, 2), WHOLE);
+        assert_eq!(j.parts_since(7, 3), 0b10_0001);
+        assert_eq!(j.parts_since(7, 5), 0b10_0000);
+        assert_eq!(j.parts_since(7, 6), 0);
+        // Never taken: all of it.
+        assert_eq!(j.parts_since(7, 0), WHOLE);
+        // Written whole: all of it, whoever took it before.
+        assert_eq!(j.note(7, WHOLE, 8), 6);
+        assert_eq!(j.parts_since(7, 7), WHOLE);
+        // A page first named in part: what was not named was not written.
+        assert_eq!(j.note(9, 0b100, 9), 0);
+        assert_eq!(j.parts_since(9, 5), 0b100);
+    }
 }
 
 #[cfg(test)]

@@ -496,6 +496,22 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and `crate::descriptor::RtvRecord::key`.
+type TargetKey = (usize, (usize, [u32; 7]));
+
+/// Whether render targets and depth the host list has already are not set
+/// again (`VICTORY_BIND_CACHE=1`; off by default: set at every call). After
+/// cgbj ca1d519 (after ZJOU acf478b8). The views are compared by what they
+/// are made of (title resource, host texture, description), not by handle:
+/// a title may write another view behind a handle. A call with the same
+/// ones saves a host view per target and the driver's call. Its effect is
+/// in the frame log ("render targets set again, left out").
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_some_and(|v| v == "1"))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -521,6 +537,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// With [`bind_cache`]: what the render target views and the depth view
+    /// the host list has are made from, once it has any (per view the host
+    /// texture, 0 for a null view, and `RtvRecord::key`).
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -1102,9 +1122,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -1296,7 +1314,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::new();
+        let mut keys: Vec<TargetKey> = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1316,14 +1335,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    keys.push((0, record.key()));
+                    views.push((None, Some(desc)));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            keys.push((texture.as_raw() as usize, record.key()));
+            views.push((Some(texture), record.desc()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -1336,8 +1357,18 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        if bind_cache() {
+            let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+            if self.host_targets.as_ref() == Some(&now) {
+                crate::framelog::add(crate::framelog::T::TargetsAgain, 1);
+                return;
+            }
+            self.host_targets = Some(now);
+        }
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1410,6 +1441,8 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        // A new host list has no targets.
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1694,8 +1727,7 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep_pipeline(&p.pso, &p.root);
         }
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,

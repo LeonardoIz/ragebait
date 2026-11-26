@@ -2395,6 +2395,16 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`declare_once`]: ranges declared written by shaders since the
+    /// list last wrote title memory (host copy, address, bytes).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`keep_once`]: the pipelines [`HostList::keep_pipeline`] kept,
+    /// by address.
+    bound: std::collections::HashSet<usize>,
+    /// With [`fill_once`]: scratch memory [`HostList::fill_scratch`] fills
+    /// since the list last wrote title memory (source, bytes), by its host
+    /// address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2421,6 +2431,14 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// A step recorded last writes title memory: what was brought up to
+    /// date, or declared, before it is not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -4136,6 +4154,42 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// Whether a range shaders write is declared once until the list next
+/// writes title memory (`VICTORY_DECLARE_ONCE=1`; off by default: every
+/// time). After cgbj b32fb99 (from Belobug dd799aad).
+///
+/// Dispatches declare the same few ranges again and again, each a step of
+/// its own that the submission walks (cgbj counted 4,000 to 5,500 a frame,
+/// each a flush of its copy's pending refreshes and two locks on the
+/// submitting thread). A range declared again with no title write between
+/// changes nothing: the ranges and their order stay what they were. Its
+/// effect is in the frame log ("declared again, left out").
+fn declare_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a pipeline a list binds again is not kept again
+/// (`VICTORY_KEEP_ONCE=1`; off by default: two interface queries and two
+/// locks at every change of pipeline). After cgbj ab86ef7 (from Belobug
+/// 92d353f8). Its effect is in the frame log ("pipelines bound again, not
+/// kept again").
+fn keep_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a root constant buffer not 256-byte aligned is copied into the
+/// list's scratch memory once for all the draws of the list that bind it,
+/// until the list next writes title memory (`VICTORY_FILL_ONCE=1`; off by
+/// default: a copy of up to 64 KiB for every bind). After cgbj c96525d (from
+/// Belobug 84ea9c12). Its effect is in the frame log ("root constants
+/// filled again, left out").
+fn fill_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -7322,7 +7376,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7331,6 +7385,26 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host address of `len` bytes of the list's scratch memory that
+    /// hold title memory at `src` as of the list's submission: with
+    /// [`fill_once`] one fill for every ask until the list next writes
+    /// title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if fill_once()
+            && let Some(&gpu) = self.deferred().filled.get(&key)
+        {
+            crate::framelog::add(crate::framelog::T::FillsAgain, 1);
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        if fill_once() {
+            self.deferred().filled.insert(key, gpu);
+        }
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7359,9 +7433,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        if declare_once() && !deferred.gpu_written.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+            crate::framelog::add(crate::framelog::T::DeclaredAgain, 1);
+            return;
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7627,6 +7704,18 @@ impl HostList {
         self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
     }
 
+    /// Keeps a pipeline the list binds, and its root signature, alive until
+    /// the list is reset: with [`keep_once`] the first time only (a kept
+    /// pipeline's address names no other while it is kept).
+    pub(crate) fn keep_pipeline(&self, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        if keep_once() && !self.deferred().bound.insert(pso.as_raw() as usize) {
+            crate::framelog::add(crate::framelog::T::PipelinesKeptAgain, 1);
+            return;
+        }
+        self.keep(pso);
+        self.keep(root);
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -7645,8 +7734,9 @@ impl HostList {
     /// (refreshes after it copy again; [`near_writes`] uses the place,
     /// without the switch any write of title memory is assumed).
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work), Some((at, len))));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
