@@ -3901,9 +3901,10 @@ impl Shadow {
             // changes the guards and the journal.
             #[cfg(feature = "diagnostics")]
             let (asking, known) = (std::time::Instant::now(), refresh_count() && self.unchanged_known(from, to));
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(copied) = crate::watch::with_writes(from, to, |now, written| {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                self.copy_stale(from, to, now, written)
+            }) {
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};

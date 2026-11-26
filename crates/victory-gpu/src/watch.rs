@@ -476,6 +476,33 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut pages = Vec::new();
+    let now = writes_into(start, end, guarded, &mut pages)?;
+    Some((now, pages))
+}
+
+/// [`writes`] (guarded) handed to `use_pages` in this thread's answer
+/// buffer, kept from one asking to the next instead of a new list each
+/// time; the same answer. After kelvaroq native/patches/0053. (Asked again
+/// from inside `use_pages`, it answers in a list of its own.)
+pub(crate) fn with_writes<T>(start: usize, end: usize, use_pages: impl FnOnce(u64, &[(usize, u64)]) -> T) -> Option<T> {
+    thread_local! {
+        static PAGES: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    PAGES.with(|pages| match pages.try_borrow_mut() {
+        Ok(mut pages) => {
+            let now = writes_into(start, end, true, &mut pages)?;
+            Some(use_pages(now, &pages))
+        }
+        Err(_) => {
+            let (now, pages) = writes(start, end, true)?;
+            Some(use_pages(now, &pages))
+        }
+    })
+}
+
+/// [`writes`] into `out` (cleared first): returns the asking's number.
+fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -483,13 +510,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        out.clear();
+        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        return Some(j.ahead_asked);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -561,13 +584,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in guarded {
         j.note(page, WHOLE, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    out.clear();
+    out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    Some(now)
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -1730,6 +1749,13 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // The reused answer buffer holds this asking's pages only.
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write(1) };
+        let (third, pages) = with_writes(start, end, |n, w| (n, w.to_vec())).expect("watched");
+        assert_eq!(pages, [(p / PAGE + 1, now), (p / PAGE + 3, third)]);
+        let pages = with_writes(p, p + PAGE, |_, w| w.to_vec()).expect("watched");
+        assert!(pages.is_empty());
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
