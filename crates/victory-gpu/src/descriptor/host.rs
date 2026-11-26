@@ -2561,6 +2561,14 @@ fn buffer_uav(
         );
         return None;
     }
+    if !raw && stride == 0 && !typed_store(desc.Format.0 as u32) {
+        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        once!(
+            format = desc.Format.0,
+            "an unordered buffer view in a format the host cannot store left null"
+        );
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -2611,12 +2619,28 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed UAV in a format the host cannot store to can remove the
+    // device. Check the actual format, including a target's host stand-in.
+    let stand_in = view != own && crate::resource::target_format(view) == own;
+    let typed = if typeless && view != 0 && !stand_in {
+        view
+    } else {
+        own
+    };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(
+            view = typed,
+            own,
+            "an unordered view in a format the host cannot store"
+        );
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
-    if view != own && crate::resource::target_format(view) == own {
+    if stand_in {
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -2632,6 +2656,33 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host supports typed unordered views of this format.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, supported)) = known.iter().find(|&&(f, _)| f == format) {
+        return supported;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let supported = host().is_some_and(|h| {
+        // SAFETY: a feature query into a structure of the corresponding size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, supported));
+    supported
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
