@@ -1274,10 +1274,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        let same = same_records() && unsafe {
-            std::slice::from_raw_parts(src as *const u8, len as usize) == std::slice::from_raw_parts(dst as *const u8, len as usize)
-        };
+        let same = same_records() && same_slots(dst, src, count, step, kind);
         if same {
             #[cfg(windows)]
             crate::framelog::add(crate::framelog::T::SameRecords, 1);
@@ -1301,6 +1298,33 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
 fn same_records() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
+}
+
+/// Whether the `count` slots of `kind` (`step` bytes apart) at `dst` hold
+/// the records of those at `src`. Only the bytes our records define are
+/// compared ([`record`]'s three words, a whole [`RtvRecord`]): the rest of
+/// a slot (of a placed heap, the title's memory) was never written by us,
+/// and is read as words, not as a slice of bytes.
+/// shortcut: a skipped copy leaves those undefined bytes past the record as
+/// they were; nothing here reads them as a view (only the heap pass's
+/// fingerprints take them in); copy them too if a title is seen to.
+fn same_slots(dst: u64, src: u64, count: u32, step: u64, kind: u32) -> bool {
+    fn same<const N: usize>(dst: u64, src: u64, count: u32, step: u64) -> bool {
+        (0..u64::from(count)).all(|i| {
+            // SAFETY: descriptor slots the title owns, each at least N words.
+            unsafe {
+                ((src + i * step) as *const [u32; N]).read_unaligned()
+                    == ((dst + i * step) as *const [u32; N]).read_unaligned()
+            }
+        })
+    }
+    const RTV_WORDS: usize = size_of::<RtvRecord>() / 4;
+    const _: () = assert!(size_of::<RtvRecord>() == RTV_WORDS * 4);
+    if matches!(kind, VIEWS_KIND | SAMPLERS) {
+        same::<3>(dst, src, count, step)
+    } else {
+        same::<RTV_WORDS>(dst, src, count, step)
+    }
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -1465,6 +1489,22 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn same_slots_compare_only_the_records() {
+        // Two view slots of 32 bytes each side: equal records, other tails.
+        let mut src = [0u32; 16];
+        let mut dst = [7u32; 16];
+        for slot in [0, 8] {
+            src[slot..slot + 3].copy_from_slice(&[VIEW_TAG, slot as u32, 1]);
+            dst[slot..slot + 3].copy_from_slice(&[VIEW_TAG, slot as u32, 1]);
+        }
+        let same = |dst: &[u32; 16], count| same_slots(dst.as_ptr() as u64, src.as_ptr() as u64, count, 32, VIEWS_KIND);
+        assert!(same(&dst, 2));
+        dst[9] = 2;
+        assert!(!same(&dst, 2));
+        assert!(same(&dst, 1));
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
