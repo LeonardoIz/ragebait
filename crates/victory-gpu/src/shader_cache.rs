@@ -157,6 +157,9 @@ fn cached(
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
+    if require_publication {
+        return Err("shader cache entry remained unreadable after retry".to_owned());
+    }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
 }
@@ -434,6 +437,35 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert!(cached(&cache, &[7; 32], b"container", translate, true).is_err());
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn offline_warm_rejects_a_corrupt_entry_that_cannot_be_removed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7; 32];
+        let container = b"container";
+        cached(&cache, &build, container, |_| Ok(shader()), true).unwrap();
+        let path = walk(dir.path()).pop().unwrap();
+        std::fs::write(&path, b"corrupt").unwrap();
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+
+        assert!(cached(&cache, &build, container, translate, true).is_err());
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
