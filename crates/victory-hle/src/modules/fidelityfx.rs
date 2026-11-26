@@ -172,6 +172,20 @@ extern "C" fn ffxQuery(_: *mut *mut Context, desc: *mut Header) -> u32 {
                     .cast::<*const std::ffi::c_char>()
                     .write(c"VIctory FidelityFX passthrough".as_ptr());
             }
+            0x1_0002 => {
+                let Some(ratio) = quality_ratio(desc.byte_add(0x10).cast::<u32>().read()) else {
+                    return PARAMETER;
+                };
+                query_out(desc, 0x18, ratio);
+            }
+            0x1_0003 => {
+                let [width, height, mode] = desc.byte_add(0x10).cast::<[u32; 3]>().read();
+                let Some(ratio) = quality_ratio(mode) else {
+                    return PARAMETER;
+                };
+                query_out(desc, 0x20, (width as f32 / ratio) as u32);
+                query_out(desc, 0x28, (height as f32 / ratio) as u32);
+            }
             0x1_0004 => query_out(desc, 0x18, 1i32),
             0x1_0005 => {
                 query_out(desc, 0x18, 0.0f32);
@@ -183,6 +197,12 @@ extern "C" fn ffxQuery(_: *mut *mut Context, desc: *mut Header) -> u32 {
         }
     }
     OK
+}
+
+/// Upscale ratio of an FFX quality mode (native AA, quality, balanced,
+/// performance, ultra performance), as the real provider reports it.
+fn quality_ratio(mode: u32) -> Option<f32> {
+    [1.0, 1.5, 1.7, 2.0, 3.0].get(mode as usize).copied()
 }
 
 /// FidelityFX's texture states mapped to D3D12_RESOURCE_STATES.
@@ -216,6 +236,8 @@ extern "C" fn ffxDispatch(context: *mut *mut Context, desc: *const Header) -> u3
     let dispatch = unsafe { &*std::ptr::from_ref(desc).cast::<Dispatch>() };
     let [color, .., output] = &dispatch.resources;
     let Some(states) = host_state(color.state).zip(host_state(output.state)) else {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!(color = color.state, output = output.state, "FidelityFX passthrough: unmapped resource state"));
         return PARAMETER;
     };
     let size = if dispatch.output == [0, 0] {
@@ -274,6 +296,21 @@ mod tests {
         assert_eq!(args.output, [1920, 1080]);
         assert_eq!(host_state(color.state), Some(0xc0));
         assert_eq!(host_state(output.state), Some(0x8));
+    }
+
+    #[test]
+    fn render_resolution_query() {
+        let (mut width, mut height) = (0u32, 0u32);
+        let mut raw = [0u64; 6];
+        raw[0] = 0x1_0003;
+        raw[2] = (1080 << 32) | 1920;
+        raw[3] = 3; // performance
+        raw[4] = &raw mut width as u64;
+        raw[5] = &raw mut height as u64;
+        assert_eq!(ffxQuery(std::ptr::null_mut(), raw.as_mut_ptr().cast()), OK);
+        assert_eq!((width, height), (960, 540));
+        raw[3] = 9;
+        assert_eq!(ffxQuery(std::ptr::null_mut(), raw.as_mut_ptr().cast()), PARAMETER);
     }
 
     #[test]
