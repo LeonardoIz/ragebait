@@ -2049,16 +2049,27 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
-    /// [`HostHeap::make_at`] for a view whose record words are `words`, in
-    /// the recording `recording` of a list ([`list_views`]): the first time
-    /// on this thread it is made in a heap the card does not see, then its
-    /// descriptor is copied into `index` each time. False if it could not
-    /// be (nothing done: the caller makes it as before).
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32, view: &View) -> bool {
+    /// [`HostHeap::make_at`] for `view`, decoded from the record whose key
+    /// is `record` (`crate::descriptor::view_and_key`, one read of the slot),
+    /// in the recording `recording` of a list ([`list_views`]): the first
+    /// time on this thread it is made in a heap the card does not see, then
+    /// its descriptor is copied into `index` each time. False if it could
+    /// not be (nothing done: the caller makes it as before).
+    ///
+    /// Only shader views of textures are shared, keyed by the record, the
+    /// texture's host copy and the first level it shows now, so a texture
+    /// that gains a level or a host copy gets a view of its own. The others
+    /// resolve host memory that can change mid-list (buffer copies, twins,
+    /// placed memory) and are made as before.
+    pub(crate) fn make_listed(&self, recording: u64, record: u64, index: u32, view: &View) -> bool {
         use crate::framelog::{T, add};
         if self.sampler {
             return false;
         }
+        let View::Shader(resource, _) = *view else { return false };
+        let resource = resource as crate::object::This;
+        let Some(texture) = crate::resource::host_resource(resource) else { return false };
+        let words = [record, windows::core::Interface::as_raw(texture) as u64, u64::from(crate::resource::first_shown(resource).unwrap_or(0))];
         let Some(host) = host() else { return false };
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
@@ -4072,10 +4083,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// that differs in one constant buffer, with the same views beside it; each
 /// table made every view anew. What a draw reads is still brought up to
 /// date for each table; only the making of the descriptor is shared.
-/// shortcut: a view made once stays as made for the rest of the recording
-/// (a texture whose host copy or shown levels change, or a buffer whose
-/// host copy is replaced, mid-list is seen from the list's next
-/// recording); drop the cache if that shows.
+/// Only shader views of textures are shared, keyed by their host copy and
+/// first shown level too (`HostHeap::make_listed`).
 /// The frame log's "list views" counts views made and copied.
 pub(crate) fn list_views() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4087,7 +4096,8 @@ pub(crate) fn list_views() -> bool {
 #[derive(Default)]
 struct ListSlots {
     recording: u64,
-    made: std::collections::HashMap<[u32; 3], u32>,
+    /// By record key, host texture and first level shown.
+    made: std::collections::HashMap<[u64; 3], u32>,
 }
 
 impl ListSlots {
@@ -4095,7 +4105,7 @@ impl ListSlots {
 
     /// The slot of `words` in `recording` (a new recording starts afresh),
     /// and whether it is new; `None` when the slots are all taken.
-    fn find(&mut self, recording: u64, words: [u32; 3]) -> Option<(u32, bool)> {
+    fn find(&mut self, recording: u64, words: [u64; 3]) -> Option<(u32, bool)> {
         if self.recording != recording {
             self.recording = recording;
             self.made.clear();
@@ -4112,7 +4122,7 @@ impl ListSlots {
     }
 
     /// Takes back the slot [`ListSlots::find`] just gave `words`.
-    fn forget(&mut self, words: [u32; 3]) {
+    fn forget(&mut self, words: [u64; 3]) {
         self.made.remove(&words);
     }
 }
@@ -4180,6 +4190,13 @@ mod tests {
         assert_eq!(slots.find(1, a), Some((0, true)));
         assert_eq!(slots.find(1, b), Some((1, true)));
         assert_eq!(slots.find(1, a), Some((0, false)));
+        // The same record over another host copy, or from another first
+        // level, is another view.
+        assert_eq!(slots.find(1, [1, 5, 3]), Some((2, true)));
+        assert_eq!(slots.find(1, [1, 2, 0]), Some((3, true)));
+        assert_eq!(slots.find(1, a), Some((0, false)));
+        slots.forget([1, 5, 3]);
+        slots.forget([1, 2, 0]);
         // A view that could not be made gives its slot back.
         assert_eq!(slots.find(1, [9; 3]), Some((2, true)));
         slots.forget([9; 3]);
@@ -4187,7 +4204,7 @@ mod tests {
         // Another recording starts afresh.
         assert_eq!(slots.find(2, b), Some((0, true)));
         for i in 1..ListSlots::MOST {
-            assert_eq!(slots.find(2, [0, i, 0]), Some((i, true)));
+            assert_eq!(slots.find(2, [0, u64::from(i), 0]), Some((i, true)));
         }
         assert_eq!(slots.find(2, [7; 3]), None);
         assert_eq!(slots.find(2, b), Some((0, false)));

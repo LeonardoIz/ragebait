@@ -3929,7 +3929,14 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let handle = table + u64::from(k) * 32;
+                // With list views the view and its record key come from one
+                // read of the slot: a second read could see another record.
+                let (decoded, record) = match listed {
+                    Some(_) => crate::descriptor::view_and_key(handle).map_or((None, 0), |(view, key)| (Some(view), key)),
+                    None => (crate::descriptor::view(handle), 0),
+                };
+                match decoded {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -3946,10 +3953,7 @@ impl State {
                     Some(view) => {
                         // Made once in this recording, then copied
                         // ([`crate::descriptor::host::list_views`]).
-                        let copied = listed.is_some_and(|recording| {
-                            let words = crate::descriptor::record_at(table + u64::from(k) * 32);
-                            host.make_listed(recording, words, index, &view)
-                        });
+                        let copied = listed.is_some_and(|recording| host.make_listed(recording, record, index, &view));
                         if !copied {
                             host.make_at(index, &view);
                         }
