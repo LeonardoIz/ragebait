@@ -3819,7 +3819,9 @@ impl Shadow {
         let threads = under_threads().min(stale.len());
         std::thread::scope(|s| {
             for _ in 1..threads {
-                s.spawn(work);
+                // A thread the system refuses leaves its pages to the
+                // others (`Scope::spawn` would panic under the lock).
+                let _ = std::thread::Builder::new().name("victory-under-wide".into()).spawn_scoped(s, work);
             }
             work();
         });
