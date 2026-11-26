@@ -522,13 +522,19 @@ fn card_clock_watch(device: &ID3D12Device, clock: &'static CardClock) {
             state.1 = Some((std::time::Instant::now(), worked()));
         }
     }
+    CARD_CLOCK_ON.store(false, Ordering::Relaxed);
     // SAFETY: the watcher owns this event.
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. Returns the idle ms per frame if the clock runs, for the
+/// overlay's GPU %.
+///
+/// shortcut: an idle stretch is counted when the next send ends it, so one
+/// spanning the second's edge lands in the next second; sample the open
+/// stretch here if the overlay's GPU % jitters for it.
+fn card_clock_line(frames: f64, ms: f64) -> Option<f64> {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
@@ -536,7 +542,11 @@ fn card_clock_line(frames: f64, ms: f64) {
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    CARD_CLOCK_ON.load(Ordering::Relaxed).then_some(idle)
 }
+
+/// Whether the card clock's thread runs ([`Host::card_clock`]).
+static CARD_CLOCK_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -4056,8 +4066,9 @@ impl Host {
             .as_ref()?;
         WATCH.call_once(|| {
             let device = self.device.clone();
-            if let Err(e) = std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(&device, clock)) {
-                tracing::warn!(error = %e, "no thread for the card's clock: the frame line's idle times stay 0");
+            match std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(&device, clock)) {
+                Ok(_) => CARD_CLOCK_ON.store(true, Ordering::Relaxed),
+                Err(e) => tracing::warn!(error = %e, "no thread for the card's clock: the frame line's idle times stay 0"),
             }
         });
         Some(clock)
@@ -8309,7 +8320,6 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
-        overlay.set_rate(fps, ms);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
@@ -8345,7 +8355,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
-        card_clock_line(frames, ms);
+        overlay.set_rate(fps, ms, card_clock_line(frames, ms));
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         #[cfg(feature = "diagnostics")]

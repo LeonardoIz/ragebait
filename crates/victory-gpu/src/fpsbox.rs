@@ -11,14 +11,11 @@
 //! glyph) into an immutable upload buffer. Each command list keeps the
 //! buffer alive until the list is reset.
 
-use std::ptr::null_mut;
-use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::System::Performance::*;
-use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetCurrentProcessId};
+use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount};
 
 use crate::host::{Host, HostList};
 
@@ -30,17 +27,6 @@ struct Stats {
     ram: Option<[u64; 2]>,
     vram: Option<[u64; 2]>,
 }
-
-impl Stats {
-    const UNAVAILABLE: Self = Self {
-        cpu: None,
-        gpu: None,
-        ram: None,
-        vram: None,
-    };
-}
-
-static STATS: Mutex<Stats> = Mutex::new(Stats::UNAVAILABLE);
 
 fn tenths(value: f64) -> u32 {
     (value * 10.0).round() as u32
@@ -56,97 +42,11 @@ fn gb_tenths(bytes: u64) -> u64 {
     bytes / TENTH_GB + u64::from(bytes % TENTH_GB >= TENTH_GB / 2)
 }
 
-struct GpuEngines {
-    query: PDH_HQUERY,
-    counter: PDH_HCOUNTER,
-}
-
-impl GpuEngines {
-    fn open() -> Option<Self> {
-        let mut query = null_mut();
-        // SAFETY: the query and counter outputs are writable, and the path
-        // is NUL terminated. The query owns the counter.
-        unsafe {
-            if PdhOpenQueryW(null_mut(), 0, &mut query) != 0 {
-                return None;
-            }
-            let mut engines = Self {
-                query,
-                counter: null_mut(),
-            };
-            // Include the separator so another PID with the same digits
-            // at its start cannot match.
-            let path: Vec<u16> = format!(r"\GPU Engine(pid_{}_*)\Utilization Percentage", GetCurrentProcessId())
-                .encode_utf16()
-                .chain([0])
-                .collect();
-            (PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut engines.counter) == 0).then_some(engines)
-        }
-    }
-
-    fn sample(&self) -> Option<u32> {
-        let (mut bytes, mut count) = (0, 0);
-        // SAFETY: the query owns a live counter. PDH first reports the
-        // size, then fills aligned storage for the items and their names.
-        unsafe {
-            if PdhCollectQueryData(self.query) != 0
-                || PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, null_mut())
-                    != PDH_MORE_DATA
-            {
-                return None;
-            }
-            let mut items = vec![
-                PDH_FMT_COUNTERVALUE_ITEM_W::default();
-                (bytes as usize).div_ceil(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>())
-            ];
-            if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, items.as_mut_ptr()) != 0 {
-                return None;
-            }
-            items
-                .get(..count as usize)?
-                .iter()
-                .filter_map(|item| {
-                    if !matches!(item.FmtValue.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
-                        return None;
-                    }
-                    let value = item.FmtValue.Anonymous.doubleValue;
-                    (value.is_finite() && value >= 0.0).then(|| tenths(value))
-                })
-                .max()
-        }
-    }
-}
-
-impl Drop for GpuEngines {
-    fn drop(&mut self) {
-        // SAFETY: this owns the open query and any counter added to it.
-        unsafe { PdhCloseQuery(self.query) };
-    }
-}
-
-fn sample_stats(host: &Host) {
-    // SAFETY: this query takes a processor group number or all groups.
-    let cores = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
-    let gpu = GpuEngines::open();
-    let mut last_cpu = None;
-    loop {
-        let now = Instant::now();
-        let current = crate::framelog::process_times().map(|(user, kernel)| (now, user + kernel));
-        let cpu = current
-            .zip(last_cpu)
-            .and_then(|((now, total), (then, old))| cpu_percent(total.checked_sub(old)?, now - then, cores).map(tenths));
-        last_cpu = current;
-        let stats = Stats {
-            cpu,
-            gpu: gpu.as_ref().and_then(GpuEngines::sample),
-            ram: crate::framelog::process_memory().map(|(working, commit)| [working, commit].map(gb_tenths)),
-            vram: host
-                .video_memory_groups()
-                .map(|[local, _]| [local[1], local[0]].map(gb_tenths)),
-        };
-        *STATS.lock().unwrap_or_else(|e| e.into_inner()) = stats;
-        std::thread::sleep(Duration::from_millis(500));
-    }
+/// Our queue's busy share of the interval: `idle_ms` is how long the card
+/// had nothing of ours queued (the host's card clock), `wall_ms` the
+/// interval. Work of other processes on the card is not counted.
+fn busy_percent(idle_ms: f64, wall_ms: f64) -> Option<f64> {
+    (wall_ms > 0.0).then(|| (100.0 * (1.0 - idle_ms / wall_ms)).clamp(0.0, 100.0))
 }
 
 /// A glyph's seven rows, five dots each (bit 4 is the left one).
@@ -313,6 +213,10 @@ pub(crate) struct Overlay {
     on: bool,
     stats: bool,
     rate: Option<(u32, u32)>,
+    /// Resources as of the last rate, sampled with it; none without stats.
+    sampled: Option<Stats>,
+    /// The process's CPU time at the last sample, and when.
+    last_cpu: Option<(Instant, u64)>,
     /// Only the current text, format and scale are cached.
     made: Option<((Display, DXGI_FORMAT, u32), Made)>,
     retry_at: Option<Instant>,
@@ -321,33 +225,49 @@ pub(crate) struct Overlay {
 impl Overlay {
     pub(crate) fn new() -> Self {
         // VICTORY_FPS_COUNTER=0 hides the overlay. VICTORY_STATS=0 shows
-        // the FPS line alone and skips background resource sampling.
+        // the FPS line alone and skips resource sampling.
         let on = std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0");
         let stats = on && std::env::var_os("VICTORY_STATS").is_none_or(|v| v != "0");
-        if stats {
-            static START: Once = Once::new();
-            START.call_once(|| {
-                let _ = std::thread::Builder::new().name("victory-stats".into()).spawn(|| {
-                    if let Some(host) = crate::host::host() {
-                        sample_stats(host);
-                    }
-                });
-            });
-        }
         Self {
             on,
             stats,
             rate: None,
+            sampled: None,
+            last_cpu: None,
             made: None,
             retry_at: None,
         }
     }
 
-    /// Updates the rate from the presenter's one-second meter.
-    pub(crate) fn set_rate(&mut self, fps: f64, ms: f64) {
-        if self.on {
-            let ms = if self.stats { tenths(ms) } else { 0 };
-            self.rate = Some((tenths(fps).min(99_999), ms));
+    /// Updates the rate from the presenter's one-second meter and samples
+    /// the resources with it, so the box changes at most once a second.
+    /// `card_idle_ms` is the card clock's idle time per frame, if it runs.
+    pub(crate) fn set_rate(&mut self, fps: f64, ms: f64, card_idle_ms: Option<f64>) {
+        if !self.on {
+            return;
+        }
+        self.rate = Some((tenths(fps).min(99_999), if self.stats { tenths(ms) } else { 0 }));
+        if self.stats {
+            self.sampled = Some(self.sample(card_idle_ms.and_then(|idle| busy_percent(idle, ms))));
+        }
+    }
+
+    fn sample(&mut self, gpu: Option<f64>) -> Stats {
+        // SAFETY: this query takes a processor group number or all groups.
+        let cores = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        let now = Instant::now();
+        let current = crate::framelog::process_times().map(|(user, kernel)| (now, user + kernel));
+        let cpu = current
+            .zip(self.last_cpu)
+            .and_then(|((now, total), (then, old))| cpu_percent(total.checked_sub(old)?, now - then, cores).map(tenths));
+        self.last_cpu = current;
+        Stats {
+            cpu,
+            gpu: gpu.map(tenths),
+            ram: crate::framelog::process_memory().map(|(working, commit)| [working, commit].map(gb_tenths)),
+            vram: crate::host::host()
+                .and_then(Host::video_memory_groups)
+                .map(|[local, _]| [local[1], local[0]].map(gb_tenths)),
         }
     }
 
@@ -362,8 +282,7 @@ impl Overlay {
         let (Some((fps, ms)), Some(bytes)) = (self.rate, pixel_bytes(format)) else {
             return;
         };
-        let stats = self.stats.then(|| *STATS.lock().unwrap_or_else(|e| e.into_inner()));
-        let display = Display { fps, ms, stats };
+        let display = Display { fps, ms, stats: self.sampled };
         let scale = (height / 360).clamp(2, 12);
         let key = (display, format, scale);
         if self.made.as_ref().is_none_or(|(old, _)| *old != key) {
@@ -496,6 +415,17 @@ mod tests {
         assert_eq!(cpu_percent(0, wall, 8), Some(0.0));
         assert_eq!(cpu_percent(1, wall, 0), None);
         assert_eq!(cpu_percent(1, Duration::ZERO, 8), None);
+    }
+
+    #[test]
+    fn busy_percent_is_the_non_idle_share_of_the_interval() {
+        assert_eq!(busy_percent(4.0, 16.0), Some(75.0));
+        assert_eq!(busy_percent(0.0, 16.0), Some(100.0));
+        assert_eq!(busy_percent(16.0, 16.0), Some(0.0));
+        // An idle stretch counted late can exceed the interval.
+        assert_eq!(busy_percent(20.0, 16.0), Some(0.0));
+        assert_eq!(busy_percent(-1.0, 16.0), Some(100.0));
+        assert_eq!(busy_percent(1.0, 0.0), None);
     }
 
     #[test]
