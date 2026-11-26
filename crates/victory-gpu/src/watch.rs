@@ -136,6 +136,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+#[derive(Default)]
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -182,23 +183,25 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1)
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
-    if pieces.len() < 2 {
-        return;
-    }
-    pieces.sort_unstable();
+pub(crate) fn ask_ahead(ranges: impl Iterator<Item = (usize, usize)>) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    ask_ahead_in(&mut j, ranges);
+}
+
+fn ask_ahead_in(j: &mut Journal, ranges: impl Iterator<Item = (usize, usize)>) {
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if j.kept {
         return;
     }
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .filter(|r| r.0 < r.1)
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
     // View memory the guards hold is left to `writes`, which answers it
     // from the guards ([`known_view`]): the kernel's write watch can only
     // fail there. Asked here with the others, a run holding such a range
@@ -301,7 +304,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
+    ask_ahead(ranges.iter().copied());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -2387,3 +2390,19 @@ mod mapping_tests {
         assert!(read.load(Ordering::SeqCst));
     }
 }
+    #[test]
+    fn kept_asking_leaves_the_range_plan_unread() {
+        let mut journal = Journal {
+            asked: 7,
+            ahead: vec![(12, 34)],
+            ahead_asked: 7,
+            kept: true,
+            ..Journal::default()
+        };
+        ask_ahead_in(&mut journal, std::iter::from_fn(|| {
+            panic!("a kept asking must not consume another range plan")
+        }));
+        assert_eq!(journal.ahead, [(12, 34)]);
+        assert_eq!(journal.asked, 7);
+        assert_eq!(journal.ahead_asked, 7);
+    }
