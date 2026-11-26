@@ -1506,6 +1506,9 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return 0;
+        }
         if kind == USER_DISPATCH_SPREAD {
             return self.dispatch_spread[usize::from(dword != 0)];
         }
@@ -3130,7 +3133,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
@@ -3173,9 +3176,35 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // DispatchX bit 5 means its dimensions are counts of threads.
+        let counted = flags & 0x20 != 0 && victory_shader::emit::rt_dispatch_fix();
+        let (groups, limit) = if counted {
+            let Some(plan) = p.stages.first().and_then(|stage| {
+                let t = stage.translated();
+                let word = stage.user_data.and_then(|(param, _)| {
+                    t.host.user_data.iter()
+                        .find(|u| u.root == RootType::Other(victory_shader::emit::USER_THREAD_LIMIT))
+                        .map(|u| (param, u.index))
+                });
+                let (groups, partial) = thread_groups([x, y, z], t.threads?, word.is_some())?;
+                Some((groups, if partial { word } else { None }))
+            }) else {
+                once!("a thread-count dispatch has unknown group size or unsupported partial groups");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a thread-count dispatch could not be represented");
+                }
+                return;
+            };
+            plan
+        } else {
+            ([x, y, z], None)
+        };
+        let [group_x, group_y, group_z] = groups;
         // More than 65,535 groups in x: spread across z for a program that
         // takes the spread words (`USER_DISPATCH_SPREAD`).
-        let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
+        let (row, asked, gx, gy, gz) =
+            victory_shader::emit::spread_groups(group_x, group_y, group_z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
         } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
@@ -3196,7 +3225,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(gx, gy, gz) };
+        unsafe {
+            if let Some((param, word)) = limit {
+                list.list.SetComputeRoot32BitConstant(param, x, word);
+            }
+            list.list.Dispatch(gx, gy, gz);
+        }
+        if counted {
+            crate::framelog::add(crate::framelog::T::ThreadDispatches, 1);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -4440,6 +4477,29 @@ impl State {
         }
         true
     }
+}
+
+/// shortcut: partial groups along Y or Z and shaders without an X mask
+/// are unsupported, until the translator masks those cases.
+fn thread_groups(threads: [u32; 3], size: [u32; 3], mask_x: bool) -> Option<([u32; 3], bool)> {
+    if size.contains(&0) || !(1..3).all(|i| threads[i].is_multiple_of(size[i])) {
+        return None;
+    }
+    let partial = !threads[0].is_multiple_of(size[0]);
+    if partial && !mask_x {
+        return None;
+    }
+    Some((std::array::from_fn(|i| threads[i].div_ceil(size[i])), partial))
+}
+
+#[cfg(test)]
+#[test]
+fn thread_counts_use_the_shader_group_size() {
+    assert_eq!(thread_groups([65, 1, 1], [64, 1, 1], true), Some(([2, 1, 1], true)));
+    assert_eq!(thread_groups([64, 4, 0], [32, 2, 1], false), Some(([2, 2, 0], false)));
+    assert_eq!(thread_groups([65, 1, 1], [64, 1, 1], false), None);
+    assert_eq!(thread_groups([64, 3, 1], [64, 2, 1], true), None);
+    assert_eq!(thread_groups([1, 1, 1], [0, 1, 1], true), None);
 }
 
 /// The host command signature for one argument of `kind` with records

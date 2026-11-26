@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "dispatch_entry.rs"]
+mod dispatch_entry;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -2242,6 +2245,7 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        self.dispatch_entry_mask()?;
         // A compute program that reads its group id x may run spread across
         // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
         // stages, near the root signature's 64 dwords), nor one whose first

@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -378,11 +378,19 @@ fn translate_plain(container: &[u8], wave_wide: bool) -> Result<HostShader, Shad
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
+    let limited = rt_dispatch_fix() && native.stage == HwStage::Cs && crate::spill::is_spilled(&native);
+    let st = structure::structure_with_entry(&p, &Default::default(), limited);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit_with_wave_wide(&c, &native, &p, &st, &io, &res, wave_wide)
+}
+
+/// VICTORY_RT_DISPATCH_FIX=1 interprets DispatchX thread counts and lets
+/// translated structure builders start with a partial EXEC mask.
+pub fn rt_dispatch_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_DISPATCH_FIX").is_some_and(|v| v == "1"))
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -455,7 +463,7 @@ fn emit_with_wave_wide(
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
+                let st = structure::structure_with_entry(&p, &Default::default(), st.entry_limited).ok()?;
                 let io = io::raise(&p, native).ok()?;
                 let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
                 Some((p, st, io, res))
@@ -512,7 +520,7 @@ fn emit_with_wave_wide(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, st.entry_limited, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -574,7 +582,7 @@ fn emit_with_wave_wide(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, st.entry_limited, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -598,7 +606,7 @@ fn emit_with_wave_wide(
     }
     let threaded = (|| {
         let p = ir::thread_edges(p, &edges)?;
-        let st = structure::structure(&p)?;
+        let st = structure::structure_with_entry(&p, &Default::default(), st.entry_limited)?;
         let io = io::raise(&p, native)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         emit_program(c, native, &p, &st, &io, &res)
@@ -622,6 +630,7 @@ fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+    entry_limited: bool,
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
@@ -642,7 +651,7 @@ fn widen(
     }
     let mut wide = std::collections::HashSet::new();
     loop {
-        let st = structure::structure_wide(p, &wide)?;
+        let st = structure::structure_with_entry(p, &wide, entry_limited)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();

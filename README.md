@@ -81,6 +81,7 @@ prebuild after a driver or translator change.
 | `VICTORY_WAVE_WIDE_LIST` | Empty | Add comma-separated shader hashes to that selection |
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
+| `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
 | `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |
 
 The best switch set measured so far is in

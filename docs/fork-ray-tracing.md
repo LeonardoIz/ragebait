@@ -63,6 +63,11 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
+- With VICTORY_RT_DISPATCH_FIX=1, DispatchX flag 0x20 gives thread counts.
+  The host rounds them to groups, and translated builder shaders start with
+  the excess X lanes outside EXEC. Partial Y or Z groups and partial X
+  groups without a translated mask are dropped. This switch does not enable
+  the builder. Framelog counts host calls under "thread-count dispatches".
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
