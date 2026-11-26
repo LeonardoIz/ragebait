@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -105,7 +106,11 @@ fn heap_locks() -> bool {
     }
 }
 
+/// A title heap address can be reused while lists still hold dynamic slots.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     /// The pass over buffer views picked by index, of this heap
     /// (`crate::draw::buffer_pass_scoped`): what it kept from its last
     /// pass, and the frame of that pass.
@@ -1263,6 +1268,7 @@ impl HostHeap {
             step,
             count,
             dynamic: extra,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
@@ -1443,6 +1449,11 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Identifies which heap owns a list's dynamic descriptor slots.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2100,7 +2111,10 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -4923,14 +4937,26 @@ mod tests {
         assert_eq!(heap.dynamic(rest), Some(4 + 16));
         // The search starts at 0 again. Slots 0..16 back, then 0..12 taken:
         // it starts at 12, with 12..16 free.
-        heap.release(4, 16);
+        heap.release(heap.id(), 4, 16);
         assert_eq!(heap.dynamic(12), Some(4));
         // 10..12 back: the free run 10..16 lies across 12. Six slots fit
         // only there.
-        heap.release(4 + 10, 2);
+        heap.release(heap.id(), 4 + 10, 2);
         assert_eq!(heap.dynamic(6), Some(4 + 10));
         // And nothing is found where nothing is.
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return;
+        };
+        let first = a.dynamic(2).expect("two dynamic slots");
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Ordering::Relaxed), DYNAMIC - 2);
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Ordering::Relaxed), DYNAMIC);
     }
 
     #[test]
@@ -4943,7 +4969,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
