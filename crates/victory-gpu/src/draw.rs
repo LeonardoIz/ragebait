@@ -2859,7 +2859,9 @@ impl State {
             Vec::new()
         };
         let began = std::time::Instant::now();
-        let slots = early.into_iter().map(|slot| (slot, true)).chain(due.into_iter().map(|slot| (slot, false)));
+        // Ordinary due slots first: the extra looks get what of the budget they leave
+        // (one not reached stays early-due for a later frame).
+        let slots = due.into_iter().map(|slot| (slot, false)).chain(early.into_iter().map(|slot| (slot, true)));
         for ((index, write), early) in slots {
             // A run for a bake draw's own ends at its own bytes, not at the
             // frame's budget or time.
