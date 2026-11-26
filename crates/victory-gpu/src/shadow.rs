@@ -80,6 +80,13 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With [`land_echo`], for a copy in the card's memory: a bit for each
+    /// 4 KiB page of title memory (counted from the one `start` lies in)
+    /// that a merge of what shaders wrote put bytes into since a refresh
+    /// last looked at it ([`Shadow::copy_landed`]); empty until then.
+    landed: Mutex<Vec<u64>>,
+    /// Whether any bit of `landed` may be set.
+    landing: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2081,6 +2088,124 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// The kernel's page: the unit [`land_echo`] compares.
+const KERNEL_PAGE: usize = 4096;
+
+/// Whether a refresh of a copy in the card's memory compares, 4 KiB at a
+/// time, the pages that only a merge of what shaders wrote may have written
+/// since, and leaves (does not store or send up) those that equal the
+/// copy's CPU side (`VICTORY_LAND_ECHO=1`; off by default). After cgbj
+/// e162982.
+///
+/// What shaders wrote comes back and goes into title memory and into the
+/// CPU's side alike (`Shadow::card_merge`, `Shadow::card_merge_relay`).
+/// In title memory that is a write like the title's: the write watch or
+/// the guards name the page, and the next refresh copied it again and sent
+/// it up to the card a second time (cgbj measured 14 MB a frame of such an
+/// echo in one copy). A page that differs (the title wrote it too) goes as
+/// before, and so does every page no merge was noted in. Its effect is in
+/// the frame log ("landed pages looked at again").
+fn land_echo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ECHO").is_some_and(|v| v == "1"))
+}
+
+/// Sets the bits of `bits` (one for each 4 KiB page from page `first` on)
+/// of the pages that title addresses `[from, to)` touch.
+fn note_pages(bits: &mut [u64], first: usize, from: usize, to: usize) {
+    for page in from / KERNEL_PAGE - first..to.div_ceil(KERNEL_PAGE) - first {
+        if let Some(word) = bits.get_mut(page / 64) {
+            *word |= 1 << (page % 64);
+        }
+    }
+}
+
+/// Title addresses `[from, to)` as runs of 4 KiB pages noted in `bits` (as
+/// [`note_pages`] sets them) and not noted: (from, to, noted), in order.
+/// The bits of noted pages that lie in the range whole are cleared (a page
+/// looked at in part is looked at again).
+fn take_noted(bits: &mut [u64], first: usize, from: usize, to: usize) -> Vec<(usize, usize, bool)> {
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut at = from;
+    while at < to {
+        let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+        let page = at / KERNEL_PAGE - first;
+        let noted = bits.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0);
+        if noted && next - at == KERNEL_PAGE {
+            bits[page / 64] &= !(1 << (page % 64));
+        }
+        match runs.last_mut() {
+            Some(last) if last.2 == noted => last.1 = next,
+            _ => runs.push((at, next, noted)),
+        }
+        at = next;
+    }
+    runs
+}
+
+/// `title` (read at title address `address`) against `held`, of one
+/// length, 4 KiB page by page of title memory: the pages that differ are
+/// stored in `held` and returned as (offset, bytes), in order.
+fn store_differing_pages(address: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < title.len() {
+        let next = (((address + at) / KERNEL_PAGE + 1) * KERNEL_PAGE - address).min(title.len());
+        if title[at..next] != held[at..next] {
+            held[at..next].copy_from_slice(&title[at..next]);
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == at => last.1 += next - at,
+                _ => out.push((at, next - at)),
+            }
+        }
+        at = next;
+    }
+    out
+}
+
+#[cfg(test)]
+mod land_echo_tests {
+    use super::{KERNEL_PAGE, note_pages, store_differing_pages, take_noted};
+
+    #[test]
+    fn noted_pages_are_taken_once_whole_and_again_in_part() {
+        const P: usize = KERNEL_PAGE;
+        let first = 100;
+        let base = first * P;
+        let mut bits = vec![0u64; 2];
+        // Pages 1 and 2 (in part), and 70.
+        note_pages(&mut bits, first, base + P + 5, base + 2 * P + 1);
+        note_pages(&mut bits, first, base + 70 * P, base + 70 * P + 8);
+        // Page 2 looked at in part only: noted still.
+        assert_eq!(
+            take_noted(&mut bits, first, base + 100, base + 2 * P + 9),
+            [(base + 100, base + P, false), (base + P, base + 2 * P + 9, true)]
+        );
+        assert_eq!(take_noted(&mut bits, first, base + P, base + 3 * P), [(base + P, base + 2 * P, false), (base + 2 * P, base + 3 * P, true)]);
+        assert_eq!(take_noted(&mut bits, first, base, base + 3 * P), [(base, base + 3 * P, false)]);
+        assert_eq!(take_noted(&mut bits, first, base + 70 * P, base + 71 * P), [(base + 70 * P, base + 71 * P, true)]);
+        assert_eq!(bits, [0, 0]);
+    }
+
+    #[test]
+    fn only_pages_that_differ_are_stored() {
+        const P: usize = KERNEL_PAGE;
+        // From the middle of a page, over three more and a bit.
+        let address = 7 * P + 3000;
+        let n = 3 * P + 500;
+        let title: Vec<u8> = (0..n).map(|i| (i * 11 + 1) as u8).collect();
+        let mut held = title.clone();
+        // A byte in the first (short) page and one in the third page.
+        held[10] ^= 1;
+        let third = 2 * P - 3000 + 7;
+        held[third] ^= 1;
+        let out = store_differing_pages(address, &title, &mut held);
+        assert_eq!(out, [(0, P - 3000), (P - 3000 + P, P)]);
+        assert_eq!(held, title);
+        assert!(store_differing_pages(address, &title, &mut held).is_empty());
+    }
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2839,6 +2964,8 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            landed: Mutex::default(),
+            landing: Default::default(),
         }
     }
 
@@ -3750,6 +3877,16 @@ impl Shadow {
         if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
             return to - from;
         }
+        if from < to && self.landing.load(Ordering::Acquire) && land_echo() {
+            self.copy_landed(from, to);
+            return to - from;
+        }
+        self.copy_plain(from, to)
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) as it was.
+    fn copy_plain(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -3757,6 +3894,60 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// With [`land_echo`]: a merge noted that shaders' bytes went into title
+    /// memory `[from, to)` (offsets) and into the CPU's side.
+    fn note_landed(&self, from: usize, to: usize) {
+        if self.card.is_none() || from >= to || !land_echo() {
+            return;
+        }
+        let (start, first) = (self.start as usize, self.start as usize / KERNEL_PAGE);
+        let mut bits = self.landed.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            let pages = (start + self.len as usize).div_ceil(KERNEL_PAGE) - first;
+            bits.resize(pages.div_ceil(64), 0);
+        }
+        note_pages(&mut bits, first, start + from, start + to);
+        self.landing.store(true, Ordering::Release);
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) with
+    /// [`land_echo`]: the 4 KiB pages a merge was noted in are compared
+    /// with the CPU's side, and only those that differ are stored and sent
+    /// up; the rest is copied as before.
+    fn copy_landed(&self, from: usize, to: usize) {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let runs = take_noted(&mut self.landed.lock().unwrap_or_else(|e| e.into_inner()), start / KERNEL_PAGE, from, to);
+        for (a, b, noted) in runs {
+            if !noted {
+                self.copy_plain(a, b);
+                continue;
+            }
+            TITLE.with_borrow_mut(|title| {
+                title.resize(b - a, 0);
+                // A page that is not there: copied as before (zeros).
+                if !crate::host::read_into(a as *const u8, title) {
+                    self.copy_plain(a, b);
+                    return;
+                }
+                // SAFETY: inside the copy's mapping (`[a, b)` is within the
+                // buffer); a refresh is one thread's, and nothing else writes
+                // the CPU side of a range no shader is writing.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(a - start), b - a) };
+                let mut sent = 0;
+                for (at, n) in store_differing_pages(a, title, held) {
+                    self.changed(a - start + at, a - start + at + n);
+                    self.card_changed(a - start + at, a - start + at + n);
+                    sent += n;
+                }
+                crate::framelog::add(crate::framelog::T::LandEchoLeft, (b - a - sent) as u64);
+                crate::framelog::add(crate::framelog::T::LandEchoSent, sent as u64);
+            });
+        }
     }
 
     /// [`Shadow::copy`] for a copy in the card's memory, with
@@ -3989,6 +4180,7 @@ impl Shadow {
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
+                self.note_landed(at, at + n);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -4074,11 +4266,13 @@ impl Shadow {
         if self.put_back_own(start + at, &title[..]) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
+            self.note_landed(at, at + n);
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.note_landed(at, at + n);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
