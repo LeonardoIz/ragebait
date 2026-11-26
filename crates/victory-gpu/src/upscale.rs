@@ -145,7 +145,7 @@ pub fn record(
                 .device
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             host.device.CreateShaderResourceView(
-                input,
+                &input,
                 Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: srv,
                     ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -160,7 +160,7 @@ pub fn record(
                 first,
             );
             host.device.CreateUnorderedAccessView(
-                target,
+                &target,
                 None::<&ID3D12Resource>,
                 Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
                     Format: uav,
@@ -173,8 +173,8 @@ pub fn record(
             );
             list.keep(&heap);
             list.gather_close();
-            if crate::texture::title_written(input) {
-                crate::texture::upload(list, color, input);
+            if crate::texture::title_written(&input) {
+                crate::texture::upload(list, color, &input);
             }
             list::ensure_state(list, color, reading);
             list::ensure_state(list, output, writing);
@@ -183,7 +183,7 @@ pub fn record(
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 {
                     UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::transmute_copy(target),
+                        pResource: std::mem::transmute_copy(&target),
                     }),
                 },
             };

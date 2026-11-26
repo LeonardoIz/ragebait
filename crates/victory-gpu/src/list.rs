@@ -693,7 +693,13 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host = |r: This| {
+        let texture = crate::resource::host_resource(r)?;
+        if crate::resource::eviction_enabled() {
+            list.keep(&texture);
+        }
+        Some(texture.as_raw().cast_const().cast())
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -886,18 +892,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Only the two state changes and the copy are left out: what
             // is noted of the textures stays as it was. After
             // triippywhale 6e502b3b.
-            let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
+            let same = windows::core::Interface::as_raw(&to) == windows::core::Interface::as_raw(&from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
+            if crate::texture::title_written(&from) {
+                crate::texture::upload(list, src, &from);
             }
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
-            crate::texture::card_writes(list, dst, to, None);
+            crate::texture::card_writes(list, dst, &to, None);
             crate::texture::host_written(dst);
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -916,7 +922,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { list.list.CopyResource(&to, &from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1044,8 +1050,8 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
+            if crate::texture::title_written(&texture) {
+                crate::texture::upload(list, src.resource, &texture);
             }
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
@@ -1059,7 +1065,8 @@ extern "system" fn copy_texture_region(
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+        crate::texture::restore_evicted(list, dst.resource, &to);
+        crate::texture::card_writes(list, dst.resource, &to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1146,8 +1153,8 @@ fn read_back(
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
-        crate::texture::upload(list, src.resource, texture);
+    if crate::texture::title_written(&texture) {
+        crate::texture::upload(list, src.resource, &texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
@@ -1217,8 +1224,10 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        crate::texture::restore_evicted(list, src, &from);
+        crate::texture::restore_evicted(list, dst, &to);
         // As for a copy (`crate::tiles`).
-        crate::texture::card_writes(list, dst, to, Some(dst_sub));
+        crate::texture::card_writes(list, dst, &to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1230,7 +1239,7 @@ extern "system" fn resolve(
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
-                    .ResolveSubresource(to, dst_sub, from, src_sub, format);
+                    .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -1240,11 +1249,11 @@ extern "system" fn resolve(
                     bottom: a.Height.min(b.Height) as i32,
                 };
                 list1.ResolveSubresourceRegion(
-                    to,
+                    &to,
                     dst_sub,
                     0,
                     0,
-                    from,
+                    &from,
                     src_sub,
                     Some(&rect),
                     format,
@@ -1293,13 +1302,13 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        let rtv = host.rtv(Some(&texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
+                    &texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
@@ -1347,7 +1356,7 @@ extern "system" fn clear_dsv(
         if crate::resource::depth_and_unordered(record.resource) {
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

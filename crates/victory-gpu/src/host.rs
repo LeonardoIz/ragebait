@@ -6141,6 +6141,20 @@ impl Host {
             crate::descriptor::sync_heaps();
         }
         let behind = late && flying();
+        if !behind && crate::resource::eviction_enabled() {
+            static LAST_EVICTION_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tenth = now_ms() / 100 + 1;
+            if LAST_EVICTION_CHECK.load(Ordering::Relaxed) != tenth
+                && STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire)
+            {
+                // SAFETY: the direct-queue fence is ours, under the submission lock.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                if completed != u64::MAX && completed >= *submitted {
+                    LAST_EVICTION_CHECK.store(tenth, Ordering::Relaxed);
+                    crate::resource::evict_if_pressured(self.video_memory());
+                }
+            }
+        }
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
         // sweep waits for a submission that finds none in the air: there is
@@ -6869,10 +6883,9 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
+    ) -> Option<(&ID3D12Resource, u32)> {
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        let wanted = legal_state(&copy.texture, wanted);
         // A frame shot names its pictures after the title's textures.
         #[cfg(feature = "diagnostics")]
         if crate::shot::recording() {
@@ -6898,7 +6911,8 @@ impl HostList {
         if crate::shot::recording() {
             crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, &copy, before, wanted);
         }
-        Some((texture, before))
+        // SAFETY: `states` owns this copy until the recording is reset.
+        Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before))
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -9695,6 +9709,9 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
             } else {
+                if slot.is_some() && crate::resource::eviction_enabled() {
+                    copy.keep(texture);
+                }
                 let already_copy_source = usize::from(state == D3D12_RESOURCE_STATE_COPY_SOURCE);
                 let barriers = [
                     transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),

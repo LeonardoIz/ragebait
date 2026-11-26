@@ -2069,7 +2069,7 @@ impl HostHeap {
         let View::Shader(resource, _) = *view else { return false };
         let resource = resource as crate::object::This;
         let Some(texture) = crate::resource::host_resource(resource) else { return false };
-        let words = [record, windows::core::Interface::as_raw(texture) as u64, u64::from(crate::resource::first_shown(resource).unwrap_or(0))];
+        let words = [record, windows::core::Interface::as_raw(&texture) as u64, u64::from(crate::resource::first_shown(resource).unwrap_or(0))];
         let Some(host) = host() else { return false };
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
@@ -2623,6 +2623,15 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
+            if kept.is_none()
+                && crate::resource::eviction_enabled()
+                && (view.waiting_texture().is_some()
+                    || placed_texture(&view).is_some_and(|view| view.waiting_texture().is_some()))
+            {
+                // A transient OOM can leave the view waiting even with
+                // `for_draw` set. The next mirror must try it again.
+                made[index as usize] = 0;
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -3712,7 +3721,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(&texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
@@ -3744,12 +3753,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
-                        texture,
+                        &texture,
                         desc.as_ref().map(std::ptr::from_ref),
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Some(texture))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -3797,7 +3806,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     desc = Some(view);
                     twin
                 }
-                None => texture,
+                None => &texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
