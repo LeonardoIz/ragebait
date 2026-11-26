@@ -8045,8 +8045,10 @@ fn present_plane_view(desc: D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
         return None;
     }
     Some(match desc.Format.0 {
-        9 | 23 | 27 | 90 => swap_format(desc.Format)?,
-        10 | 11 | 13 | 24 | 28 | 29 | 31 | 87 | 91 => desc.Format,
+        // sRGB planes are read as UNORM, like the swap chain they are copied
+        // to, so a composited plane keeps the bytes a copied one shows.
+        9 | 23 | 27 | 29 | 90 | 91 => swap_format(desc.Format)?,
+        10 | 11 | 13 | 24 | 28 | 31 | 87 => desc.Format,
         _ => return None,
     })
 }
@@ -8162,7 +8164,7 @@ mod present_tests {
         assert_eq!(present_plane_view(desc), Some(DXGI_FORMAT_R8G8B8A8_UNORM));
         assert_eq!(
             present_plane_view(D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, ..desc }),
-            Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM),
         );
         assert_eq!(
             present_plane_view(D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_UINT, ..desc }),

@@ -1359,7 +1359,17 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let composite = planes > 1 && composite_present();
+    // Only when two planes really carry a texture: an empty second slot
+    // keeps the single-plane path and its async present.
+    let composite = planes > 1
+        && composite_present()
+        && !plane_parameters.is_null()
+        // SAFETY: the title passes `planes` plane descriptions.
+        && unsafe {
+            plane_resources(std::slice::from_raw_parts(plane_parameters, (planes as usize).min(MAX_PRESENT_PLANES)))
+        }
+        .nth(1)
+        .is_some();
     // The deferred present carries a single texture. Keep the full plane
     // list together by showing multi-plane frames on this thread.
     #[cfg(windows)]
