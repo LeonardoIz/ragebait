@@ -2835,7 +2835,8 @@ impl State {
             }
             None => (span, per_frame),
         };
-        // Reserve one batch per frame, even if another heap pass runs on the worker.
+        // Reserve one batch per frame, even if another heap pass runs on the worker:
+        // spent by the first pass that finds candidates, so a later heap's still get theirs.
         // At most 32 extra fingerprints (1.5 MiB sampled) of textures up to 128 KiB;
         // past 48 KiB the fingerprint samples 3 x 16 KiB, so writes outside those go unseen.
         const WATCH_SLOTS: usize = 32;
@@ -2845,11 +2846,14 @@ impl State {
         let early = if watch
             && !only
             && SPENT.load(Ordering::Relaxed) < bytes_at_most
-            && WATCH_FRAME.fetch_max(frame + 1, Ordering::Relaxed) <= frame
+            && WATCH_FRAME.load(Ordering::Relaxed) <= frame
         {
             let started = std::time::Instant::now();
             let slots = host.texture_slots_early(frame, WATCH_SLOTS);
             crate::framelog::add(crate::framelog::T::TextureWatchUs, started.elapsed().as_micros() as u64);
+            if !slots.is_empty() {
+                WATCH_FRAME.fetch_max(frame + 1, Ordering::Relaxed);
+            }
             slots
         } else {
             Vec::new()
