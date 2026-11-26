@@ -939,6 +939,9 @@ fn alias_in_runs(physical: &mut Physical, to: usize, from: usize, len: usize) ->
         }
         unmap(physical, at, bytes);
         if !map_run(physical, at, end - first, &wanted[first]) {
+            // The caller reports success anyway (`CopyPageMappingsBatchX`): what
+            // was not done yet shows nothing rather than what it showed before.
+            unmap(physical, at, to + len - at);
             return false;
         }
     }
@@ -1757,6 +1760,29 @@ mod tests {
         assert_eq!((protect(b + PAGE), protect(b + 2 * PAGE)), (PAGE_READONLY, PAGE_READONLY));
         assert!(alias_in_runs(&mut physical(), b, 0, 3 * PAGE));
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, std::ptr::null()), a as *mut c_void);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_MAP_RUNS`: a run that fails to map leaves the pages after it
+    /// showing nothing, not what they showed before.
+    #[test]
+    fn a_failed_run_clears_the_runs_after_it() {
+        let pages = allocate(3);
+        let (a, b) = (reserve(2), reserve(2));
+        // Pages 0 and 2 at `a`: two runs. `b + PAGE` shows page 1, stale.
+        let source = [pages[0], pages[2]];
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, source.as_ptr()), a as *mut c_void);
+        assert_eq!(XMemMapPhysicalPages((b + PAGE) as *mut c_void, 1, &pages[1]), (b + PAGE) as *mut c_void);
+        // `b` is no placeholder any more, so the first run cannot map there.
+        // SAFETY: placeholders of ours: page `b` split off, then given up.
+        unsafe {
+            VirtualFree(b as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            assert_ne!(VirtualFree(b as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+        assert!(!alias_in_runs(&mut physical(), b, a, 2 * PAGE));
+        assert!(slice_at(&physical().views, b + PAGE).is_none());
+        assert_eq!(query((b + PAGE) as *const c_void).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, std::ptr::null()), a as *mut c_void);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
