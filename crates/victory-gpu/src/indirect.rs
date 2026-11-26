@@ -924,7 +924,7 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::System::Threading::CreateEventW;
     use windows::core::Interface;
 
     const WORKER_CS: &str = r#"
@@ -1103,10 +1103,7 @@ void main() {
                 let cmd: ID3D12CommandList = self.list.cast().unwrap();
                 self.queue.ExecuteCommandLists(&[Some(cmd)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
-                self.fence
-                    .SetEventOnCompletion(self.submitted, self.event)
-                    .unwrap();
-                WaitForSingleObject(self.event, INFINITE);
+                crate::host::wait_for_fence(&self.device, &self.fence, self.submitted, self.event).unwrap();
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
@@ -2433,7 +2430,7 @@ mod bare_cost {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::System::Threading::CreateEventW;
     use windows::core::{Interface, s};
 
     use crate::host::{compile, transition};
@@ -2500,6 +2497,7 @@ void work() {
     }
 
     struct Rig {
+        device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
         list: ID3D12GraphicsCommandList,
@@ -2808,6 +2806,7 @@ void work() {
                 list.ClearDepthStencilView(depth_written, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
                 let [first_target, second_target] = target;
                 let mut rig = Rig {
+                    device,
                     queue,
                     allocator,
                     list,
@@ -2847,8 +2846,7 @@ void work() {
                 let run: ID3D12CommandList = self.list.cast().unwrap();
                 self.queue.ExecuteCommandLists(&[Some(run)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
-                self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
-                WaitForSingleObject(self.event, INFINITE);
+                crate::host::wait_for_fence(&self.device, &self.fence, self.submitted, self.event).unwrap();
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }

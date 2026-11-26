@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory4,
 };
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::core::{Interface, PCSTR};
 
 /// Draws a frame (the title's gameplay frames hold about 3,200 indirect
@@ -434,8 +434,7 @@ fn bench_indirect_draw_barriers() {
             queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
             submitted += 1;
             queue.Signal(&fence, submitted).unwrap();
-            fence.SetEventOnCompletion(submitted, event).unwrap();
-            WaitForSingleObject(event, INFINITE);
+            crate::host::wait_for_fence(device, &fence, submitted, event).unwrap();
             let ran = running.elapsed().as_secs_f64() * 1e3;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data)).unwrap();

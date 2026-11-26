@@ -199,19 +199,20 @@ impl Display {
             format!("{}.{}", tenths / 10, tenths % 10)
         }
 
+        let Some(stats) = self.stats else {
+            return format!("{} FPS", decimal(self.fps.into()));
+        };
         let mut text = format!("FPS {} / {} ms", decimal(self.fps.into()), decimal(self.ms.into()));
-        if let Some(stats) = self.stats {
-            for (label, value) in [("CPU %", stats.cpu), ("GPU %", stats.gpu)] {
-                let value = value.map_or_else(|| "n/a".into(), |v| decimal(v.into()));
-                let _ = write!(text, "\n{label} {value}");
-            }
-            for (label, value) in [("RAM", stats.ram), ("VRAM", stats.vram)] {
-                let value = value.map_or_else(
-                    || "n/a".into(),
-                    |[used, limit]| format!("{} / {} GB", decimal(used), decimal(limit)),
-                );
-                let _ = write!(text, "\n{label} {value}");
-            }
+        for (label, value) in [("CPU %", stats.cpu), ("GPU %", stats.gpu)] {
+            let value = value.map_or_else(|| "n/a".into(), |v| decimal(v.into()));
+            let _ = write!(text, "\n{label} {value}");
+        }
+        for (label, value) in [("RAM", stats.ram), ("VRAM", stats.vram)] {
+            let value = value.map_or_else(
+                || "n/a".into(),
+                |[used, limit]| format!("{} / {} GB", decimal(used), decimal(limit)),
+            );
+            let _ = write!(text, "\n{label} {value}");
         }
         text
     }
@@ -299,12 +300,22 @@ struct Made {
     pitch: u32,
 }
 
+fn retry_upload<T>(retry_at: &mut Option<Instant>, now: impl Fn() -> Instant, create: impl FnOnce() -> Option<T>) -> Option<T> {
+    if retry_at.is_some_and(|at| now() < at) {
+        return None;
+    }
+    let made = create();
+    *retry_at = made.is_none().then(|| now() + Duration::from_secs(1));
+    made
+}
+
 pub(crate) struct Overlay {
     on: bool,
     stats: bool,
     rate: Option<(u32, u32)>,
     /// Only the current text, format and scale are cached.
     made: Option<((Display, DXGI_FORMAT, u32), Made)>,
+    retry_at: Option<Instant>,
 }
 
 impl Overlay {
@@ -328,13 +339,15 @@ impl Overlay {
             stats,
             rate: None,
             made: None,
+            retry_at: None,
         }
     }
 
     /// Updates the rate from the presenter's one-second meter.
     pub(crate) fn set_rate(&mut self, fps: f64, ms: f64) {
         if self.on {
-            self.rate = Some((tenths(fps).min(99_999), tenths(ms)));
+            let ms = if self.stats { tenths(ms) } else { 0 };
+            self.rate = Some((tenths(fps).min(99_999), ms));
         }
     }
 
@@ -354,7 +367,9 @@ impl Overlay {
         let scale = (height / 360).clamp(2, 12);
         let key = (display, format, scale);
         if self.made.as_ref().is_none_or(|(old, _)| *old != key) {
-            self.made = Made::new(host, &display.text(), format, scale, bytes).map(|made| (key, made));
+            self.made = retry_upload(&mut self.retry_at, Instant::now, || {
+                Made::new(host, &display.text(), format, scale, bytes).map(|made| (key, made))
+            });
         }
         let Some((_, made)) = self.made.as_ref() else {
             return;
@@ -424,19 +439,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_the_fps_line_and_optional_resource_lines() {
-        let mut display = Display {
+    fn a_failed_upload_skips_rebuilds_for_one_second() {
+        let start = Instant::now();
+        let failed = start + Duration::from_millis(40);
+        let now = std::cell::Cell::new(start);
+        let mut retry_at = Some(start);
+        assert_eq!(retry_upload::<()>(&mut retry_at, || now.get(), || {
+            now.set(failed);
+            None
+        }), None);
+        now.set(failed + Duration::from_millis(999));
+        assert_eq!(retry_upload::<()>(&mut retry_at, || now.get(), || panic!("rebuilt during the cooldown")), None);
+        now.set(failed + Duration::from_secs(1));
+        assert_eq!(retry_upload(&mut retry_at, || now.get(), || Some(())), Some(()));
+        assert_eq!(retry_at, None);
+    }
+
+    #[test]
+    fn fps_only_uses_the_original_text_and_box_size() {
+        let display = Display {
             fps: 600,
             ms: 167,
             stats: None,
         };
-        assert_eq!(display.text(), "FPS 60.0 / 16.7 ms");
-        display.stats = Some(Stats {
-            cpu: Some(125),
-            gpu: None,
-            ram: Some([123, 157]),
-            vram: Some([68, 110]),
-        });
+        let text = display.text();
+        assert_eq!(text, "60.0 FPS");
+        let (width, height, _) = bitmap(&text, 2);
+        assert_eq!((width, height), (102, 22));
+    }
+
+    #[test]
+    fn formats_the_frame_time_and_resource_lines() {
+        let display = Display {
+            fps: 600,
+            ms: 167,
+            stats: Some(Stats {
+                cpu: Some(125),
+                gpu: None,
+                ram: Some([123, 157]),
+                vram: Some([68, 110]),
+            }),
+        };
         let text = display.text();
         assert_eq!(
             text,

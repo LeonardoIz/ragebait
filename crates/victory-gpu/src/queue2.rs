@@ -57,7 +57,7 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::core::Interface;
 
 /// `VICTORY_QUEUE2`, a sum of bits; unset or 0: off, everything goes
@@ -286,14 +286,7 @@ impl Lane {
     /// Waits on this thread, with its `event`, until the card has run
     /// `job`.
     pub(crate) fn wait(&self, job: u64, event: HANDLE) -> windows::core::Result<()> {
-        // SAFETY: the lane's fence and the caller's event.
-        unsafe {
-            if self.fence.GetCompletedValue() < job {
-                self.fence.SetEventOnCompletion(job, event)?;
-                WaitForSingleObject(event, INFINITE);
-            }
-        }
-        Ok(())
+        crate::host::wait_for_fence(&self.device, &self.fence, job, event)
     }
 }
 
@@ -483,14 +476,8 @@ impl Second {
             return;
         };
         while let Ok((hold, job)) = holds.recv() {
-            // SAFETY: our fence and this thread's event.
-            unsafe {
-                if self.reached.GetCompletedValue() < hold {
-                    if self.reached.SetEventOnCompletion(hold, event).is_err() {
-                        return;
-                    }
-                    WaitForSingleObject(event, INFINITE);
-                }
+            if crate::host::wait_for_fence(&self.device, &self.reached, hold, event).is_err() {
+                return;
             }
             if self.up.done(job) {
                 continue;
@@ -793,11 +780,7 @@ void main() {
 
         /// Waits for everything sent to the direct queue and the lanes.
         fn land(&mut self) {
-            // SAFETY: our fence and event.
-            unsafe {
-                self.fence.SetEventOnCompletion(self.submitted, self.event).expect("a wait");
-                WaitForSingleObject(self.event, INFINITE);
-            }
+            crate::host::wait_for_fence(&self.device, &self.fence, self.submitted, self.event).expect("a wait");
             for lane in [&self.second.down, &self.second.up] {
                 let last = lock(&lane.state).sent;
                 lane.wait(last, self.event).expect("a wait");
