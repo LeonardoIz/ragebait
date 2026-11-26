@@ -1114,12 +1114,60 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a PresentX call: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
+}
+
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+#[cfg(windows)]
+pub(crate) const MAX_PRESENT_PLANES: usize = 8;
+
+/// `VICTORY_PRESENT_COMPOSITE=0` uses plane 0 for multi-plane presents too.
+#[cfg(windows)]
+fn composite_present() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").as_deref() != Ok("0"))
+}
+
+/// SAFETY: each nonempty plane with a non-null list points to its resources.
+#[cfg(windows)]
+unsafe fn plane_resources(planes: &[Plane]) -> impl Iterator<Item = This> + '_ {
+    planes.iter().take(MAX_PRESENT_PLANES).filter_map(|plane| {
+        if plane.count == 0 || plane.resources.is_null() {
+            return None;
+        }
+        // SAFETY: the caller provides the plane's resource list.
+        let resource = unsafe { *plane.resources };
+        (!resource.is_null()).then_some(resource)
+    })
+}
+
+#[cfg(windows)]
+fn show_planes(planes: &[Plane], frame: u64) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    before_sync();
+    // SAFETY: the planes and their lists are borrowed from this PresentX call.
+    let resources: Vec<_> = unsafe { plane_resources(planes) }
+        .filter_map(|resource| crate::resource::host_copy(resource).map(|copy| (resource, copy)))
+        .collect();
+    let sources: Vec<_> = resources
+        .iter()
+        .map(|(_, copy)| (&copy.texture, copy.state.load(Ordering::Relaxed)))
+        .collect();
+    if let Some((&(primary, state), overlays)) = sources.split_first() {
+        let shown = host.present_planes(primary, state, Some(overlays), frame);
+        #[cfg(feature = "diagnostics")]
+        blinks(frame, resources[0].0, state, shown);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = shown;
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1281,10 +1329,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the first resource of each PresentX plane in our window.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1314,7 +1359,11 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let composite = planes > 1 && composite_present();
+    // The deferred present carries a single texture. Keep the full plane
+    // list together by showing multi-plane frames on this thread.
+    #[cfg(windows)]
+    let sent_behind = !composite && present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
@@ -1390,7 +1439,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         }
     }
     #[cfg(windows)]
-    if !sent_behind
+    if composite && !plane_parameters.is_null() {
+        // SAFETY: the title passes the specified number of plane descriptions.
+        let planes = unsafe {
+            std::slice::from_raw_parts(plane_parameters, (planes as usize).min(MAX_PRESENT_PLANES))
+        };
+        show_planes(planes, frame);
+    } else if !sent_behind
         && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -1579,6 +1634,34 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn selects_first_resource_of_valid_planes_in_call_order() {
+        let first = std::ptr::without_provenance(1);
+        let second = std::ptr::without_provenance(2);
+        let ignored = std::ptr::without_provenance(3);
+        let empty_list = [std::ptr::null()];
+        let first_list = [first, ignored];
+        let make = |count, resources| Plane {
+            token: 0,
+            count,
+            resources,
+            _rest: [0; 6],
+        };
+        let mut planes = std::array::from_fn::<_, { MAX_PRESENT_PLANES + 1 }, _>(|_| {
+            make(0, std::ptr::null())
+        });
+        planes[0] = make(2, first_list.as_ptr());
+        planes[1] = make(1, std::ptr::null());
+        planes[2] = make(1, empty_list.as_ptr());
+        planes[3] = make(0, &ignored);
+        planes[4] = make(1, &second);
+        planes[MAX_PRESENT_PLANES] = make(1, &ignored);
+        // SAFETY: all non-null resource lists point to live arrays or slots.
+        let selected: Vec<_> = unsafe { plane_resources(&planes) }.collect();
+        assert_eq!(selected, [first, second]);
+    }
 
     #[cfg(windows)]
     #[test]
