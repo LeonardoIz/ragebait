@@ -1189,7 +1189,7 @@ struct Hosted {
 #[cfg(windows)]
 mod eviction;
 #[cfg(windows)]
-pub(crate) use eviction::{evict_if_pressured, eviction_enabled, reuploaded};
+pub(crate) use eviction::{evict_if_pressured, eviction_enabled, eviction_skipped, reuploaded};
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and

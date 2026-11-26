@@ -1,6 +1,6 @@
 //! Budget-driven eviction of reloadable texture copies.
 
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
 use super::{
@@ -144,11 +144,45 @@ pub(crate) fn reuploaded(reupload: &AtomicBool) -> bool {
     reupload.swap(false, Relaxed)
 }
 
+/// When [`evict_if_pressured`] last ran (`crate::host::now_ms`).
+static LAST_RUN_MS: AtomicU64 = AtomicU64::new(0);
+const STALL_MS: u64 = 5_000;
+
+/// Whether a trim was needed but none ran for [`STALL_MS`].
+fn stalled(last_run_ms: u64, now_ms: u64, needed: impl FnOnce() -> bool) -> bool {
+    now_ms.saturating_sub(last_run_ms) >= STALL_MS && needed()
+}
+
+/// The submitting thread found no idle moment to trim in (late or relay
+/// flights in the air, a submission under way, or the direct fence behind).
+/// Counted in the frame log's "eviction checks stalled", at most once per
+/// 100 ms, while a trim was needed and none ran for [`STALL_MS`].
+pub(crate) fn eviction_skipped(video: impl FnOnce() -> Option<[u64; 4]>) {
+    static COUNTED_TENTH: AtomicU64 = AtomicU64::new(0);
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let now = crate::host::now_ms();
+    let tenth = now / 100 + 1;
+    if COUNTED_TENTH.load(Relaxed) == tenth
+        || !stalled(LAST_RUN_MS.load(Relaxed), now, || {
+            ALLOCATION_FAILED.load(Relaxed)
+                || pressure(video(), texture_bytes(), texture_budget()) != (0, 0)
+        })
+    {
+        return;
+    }
+    COUNTED_TENTH.store(tenth, Relaxed);
+    add(T::VramEvictStalled, 1);
+    SAID.call_once(|| {
+        tracing::warn!("VRAM eviction needed but not run for 5 s: no idle moment between submissions (late or relay flights?)");
+    });
+}
+
 /// Call under the host submission lock after the previous fence has
 /// completed, and before preparing the next lists. A list being recorded,
 /// a pending upload, or a descriptor that can still be indexed by a shader
 /// keeps an Arc or COM reference of its own.
 pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
+    LAST_RUN_MS.store(crate::host::now_ms(), Relaxed);
     let (mut local, mut textures_needed) = pressure(video, texture_bytes(), texture_budget());
     if ALLOCATION_FAILED.swap(false, Relaxed) {
         local = local.max(HEADROOM);
@@ -228,7 +262,7 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
 mod tests {
     use super::{
         ALLOCATION_FAILED, Candidate, HEADROOM, carry_eviction, cold_state, may_reload, may_retry,
-        pressure, retry_at, reuploaded,
+        pressure, retry_at, reuploaded, stalled,
     };
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
@@ -326,5 +360,16 @@ mod tests {
         assert!(!ALLOCATION_FAILED.load(Relaxed));
         assert_eq!(retry_at(true, true, true, 5), Some(1_005));
         assert!(ALLOCATION_FAILED.swap(false, Relaxed));
+    }
+
+    #[test]
+    fn a_stall_is_counted_only_when_needed_and_late() {
+        assert!(!stalled(1_000, 5_999, || panic!(
+            "pressure read before 5 s"
+        )));
+        assert!(!stalled(1_000, 6_000, || false));
+        assert!(stalled(1_000, 6_000, || true));
+        // Never run since the start.
+        assert!(stalled(0, 5_000, || true));
     }
 }
