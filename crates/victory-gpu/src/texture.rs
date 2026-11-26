@@ -338,7 +338,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
-    card_writes(list, placed, to, None);
+    card_writes(list, placed, &to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
@@ -370,13 +370,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(&from, index), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                .CopyTextureRegion(&part(&to, index), 0, 0, 0, &rows(of_read), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
@@ -656,6 +656,12 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// Whether a GPU copy or alias supplied contents that a detile may not recover.
+pub(crate) fn has_host_contents(resource: usize) -> bool {
+    host_wrote(resource)
+        || THROUGH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|map| map.contains_key(&resource))
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -681,6 +687,16 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// Restores the untouched texels before a partial GPU write, or before a
+/// read path that normally expects the host copy to be populated already.
+pub(crate) fn restore_evicted(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    if crate::resource::eviction_enabled()
+        && crate::resource::host_copy(resource).is_some_and(|copy| copy.reupload.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        upload(list, resource, texture);
+    }
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
@@ -798,9 +814,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // again if it detiles (the next list then uploads once more).
     {
         let staging = staging.clone();
+        let replacement = crate::resource::eviction_enabled()
+            .then(|| crate::resource::host_copy(resource))
+            .flatten()
+            .filter(|copy| copy.reupload.load(Relaxed));
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            if replacement.as_ref().is_some_and(|copy| copy.reupload.swap(false, Relaxed)) {
+                crate::framelog::add(crate::framelog::T::VramReuploads, 1);
+            }
         });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -1270,10 +1293,13 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    let _ = take_staged(resource);
+}
+
+/// Removes cached upload state. The caller may drop it after releasing its locks.
+pub(crate) fn take_staged(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
 }
 
 /// Where a staged title texture's memory is: address and bytes.

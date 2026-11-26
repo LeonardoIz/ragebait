@@ -1355,7 +1355,7 @@ impl State {
                 keys.push((texture.as_raw() as usize, record.key()));
                 views.push((Some(texture), record.desc()));
             } else {
-                rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+                rtvs.push(host.rtv(Some(&texture), record.desc().as_ref()));
             }
         }
         self.depth = 0;
@@ -1363,7 +1363,7 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            self.depth_state = depth_state(&texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1378,9 +1378,9 @@ impl State {
                 return;
             }
             self.host_targets = Some(now);
-            rtvs = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+            rtvs = views.iter().map(|(texture, desc)| host.rtv(texture.as_ref(), desc.as_ref())).collect();
         }
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let dsv = dsv.map(|(texture, record)| host.dsv(&texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -3013,8 +3013,12 @@ impl State {
                     continue;
                 }
             };
-            let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            let title_fills = crate::resource::host_resource(resource).is_some_and(|texture| crate::texture::title_written(&texture));
             if !title_fills {
+                if crate::resource::eviction_enabled() && crate::resource::host_waits(resource) {
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
                 continue;
@@ -4844,9 +4848,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &t);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
