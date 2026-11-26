@@ -675,6 +675,64 @@ struct Guards {
     /// With [`absent_once`]: for blocks of `absent`, when ([`guard_ms`])
     /// Windows last said they are uncommitted.
     verified: BTreeMap<usize, u64>,
+    /// With [`rest`]: blocks a write fault opened, and when.
+    opened: BTreeMap<usize, std::time::Instant>,
+}
+
+impl Guards {
+    /// Whether `block` is left open for now ([`rest`]): the title has just
+    /// written it.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault opened `block` ([`rest`]).
+    fn opened_now(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+}
+
+/// How long a block a write fault of the title's has just opened is left
+/// open by the askings that take it (`VICTORY_GUARD_REST=1`: 3 ms;
+/// `=<microseconds>`; unset or `0`: not at all, as before). After cgbj
+/// 7bc7c07.
+///
+/// cgbj counted 586 faults a frame, 220 of them within 3 ms of the asking
+/// that had made the block read-only while the title was still writing it:
+/// made read-only, written, opened, up to a dozen times a frame, each a
+/// change of protection under the guards' lock with other faults waiting.
+/// A block that rests is reported written at each asking, so nothing is
+/// missed; the first asking after its rest makes it read-only again. Its
+/// effect is in the frame log ("guards: ... rested").
+fn rest() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| match std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(1) => 3000,
+        Some(us) => us,
+        None => 0,
+    });
+    std::time::Duration::from_micros(us)
+}
+
+/// Whether a write fault opens only the view it came through, and leaves
+/// the page's other views read-only, noted as not clean any more
+/// (`VICTORY_OPEN_ONE_VIEW=1`; off by default: it opens them all, as
+/// before). After cgbj 7bc7c07.
+///
+/// The others were opened (a change of protection each, under the guards'
+/// lock) and made read-only again at their next asking, though the title
+/// wrote through one view only. Not clean, they are reported written at
+/// their next asking as before; a write through one of them faults and
+/// opens it. Their group stays noted (`Guards::aliased`), so that such a
+/// write still tells the others. Its effect is in the frame log ("guards:
+/// ... views left read-only").
+fn open_one_view() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -725,6 +783,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
+    opened: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -928,6 +987,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let rest = rest();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -963,6 +1023,10 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if g.rests(block, rest) {
+                // Just written by the title: left open, written again next
+                // time.
+                crate::framelog::add(crate::framelog::T::GuardRests, 1);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1181,6 +1245,30 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         }
     }
     any
+}
+
+/// [`open`] for a write fault of the title's at `at`, with [`rest`] and
+/// [`open_one_view`]; true if the block was guarded.
+fn open_fault(g: &mut Guards, at: usize) -> bool {
+    let block = at / BLOCK;
+    let opened = if open_one_view() {
+        let any = open_here(g, at, at + 1);
+        if any && g.aliased.contains(&block) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                if alias != block && g.clean.remove(&alias) {
+                    crate::framelog::add(crate::framelog::T::GuardViewsKept, 1);
+                }
+            }
+        }
+        any
+    } else {
+        open(g, at, at + 1)
+    };
+    if opened && !rest().is_zero() {
+        g.opened_now(block);
+    }
+    opened
 }
 
 /// [`open`] for one range, without the other views of its pages.
@@ -1466,7 +1554,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open_fault(&mut g, at) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
@@ -1495,6 +1583,33 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_just_opened_rests_and_others_do_not() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            verified: BTreeMap::new(),
+            opened: BTreeMap::new(),
+        };
+        let rest = std::time::Duration::from_secs(60);
+        g.opened_now(5);
+        assert!(g.rests(5, rest));
+        assert!(!g.rests(6, rest));
+        // Off: nothing rests.
+        assert!(!g.rests(5, std::time::Duration::ZERO));
+        // Over: not any more.
+        g.opened.insert(7, std::time::Instant::now() - std::time::Duration::from_millis(5));
+        assert!(!g.rests(7, std::time::Duration::from_millis(3)));
+    }
 }
 
 #[cfg(test)]
