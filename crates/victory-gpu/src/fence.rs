@@ -97,26 +97,74 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
+        drop(waiters);
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
         #[cfg(windows)]
         if crate::host::late() {
-            drop(waiters);
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+        }
+        // A null event means "block until reached".
+        #[cfg(windows)]
+        if fence_wait() {
+            if block_until(fence, value) {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
+        // shortcut: fails instead of blocking unless `VICTORY_FENCE_WAIT=1`,
+        // as a signal may never come; turn it on by default once runs show
+        // the waits end.
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
     S_OK
+}
+
+/// `VICTORY_FENCE_WAIT=1`: `SetEventOnCompletion` with a null event blocks
+/// until the fence reaches the value, 250 ms at most, instead of failing at
+/// once (after cgbj e05d463). Off by default: it stalls the title's thread
+/// where the call used to return.
+#[cfg(windows)]
+fn fence_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FENCE_WAIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Waits until the fence is at `value`, 250 ms at most: woken by [`set`],
+/// and every 10 ms running the queues' held lists (a signal may be behind
+/// them). Whether it got there.
+#[cfg(windows)]
+fn block_until(fence: &Fence, value: u64) -> bool {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let current = fence.value.load(Ordering::Acquire);
+        if current >= value {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        // SAFETY: compares the fence's value with `current`, both 8 bytes
+        // that live through the call.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                (&raw const fence.value).cast(),
+                (&raw const current).cast(),
+                size_of::<u64>(),
+                (left.as_millis() as u32).clamp(1, 10),
+            );
+        }
+        crate::queue::release_held(false);
+    }
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
@@ -132,6 +180,14 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    // Threads waiting on the value's address ([`block_until`], or the
+    // title's own `WaitOnAddress` on the fence's GPU address) wake now.
+    #[cfg(windows)]
+    // SAFETY: only names the address.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -353,6 +409,28 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// `VICTORY_FENCE_WAIT`: a blocking wait ends when another thread sets
+    /// the fence, and gives up after 250 ms.
+    #[cfg(windows)]
+    #[test]
+    fn blocking_waits_wake_on_set_or_time_out() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let at = f as usize;
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            set(at as This, 3);
+        });
+        let started = std::time::Instant::now();
+        assert!(block_until(fence(f), 3));
+        assert!(started.elapsed() < std::time::Duration::from_millis(240), "woken, not timed out");
+        setter.join().unwrap();
+        let started = std::time::Instant::now();
+        assert!(!block_until(fence(f), 4));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
