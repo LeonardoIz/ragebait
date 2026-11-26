@@ -1060,6 +1060,13 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_TEXTURE_WATCH=1` (off by default) adds bounded fingerprint checks
+/// for bindless textures recently found changed, without arming page guards.
+fn texture_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_WATCH").is_some_and(|v| v == "1"))
+}
+
 /// Uploads of textures picked by index looked at again in the next frame
 /// because a look had found them changed ([`recheck_soon`]), since the
 /// start.
@@ -2678,12 +2685,10 @@ impl State {
     /// per frame and in all; the rest waits for later lists and frames.
     /// The most recently written slots first (`TextureQueue::due`); slots
     /// draws read through tables are not in the queue.
-    /// shortcut: uploaded once, and again only when the title rewrites the
-    /// slot. A placed texture not all mapped yet is uploaded with what is
-    /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
-    /// in place of others, and contents changed with no descriptor write,
-    /// are missed (hook the page-mapping events for those).
+    /// A placed texture not all mapped yet is uploaded with what is there
+    /// and looked at again when more of it is mapped. Runtime mapping and
+    /// write notices make slots due again. The fingerprint rechecks below
+    /// cover some writes that arrive without a notice.
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     /// On a thread of its own the pass records into lists of its own, and
     /// the slots show what they upload from then on
@@ -2830,8 +2835,27 @@ impl State {
             }
             None => (span, per_frame),
         };
+        // Reserve one batch per frame, even if another heap pass runs on the worker.
+        // At most 32 extra fingerprints (1.5 MiB sampled) and 4 MiB of source textures.
+        const WATCH_SLOTS: usize = 32;
+        const WATCH_BYTES: u64 = 128 << 10;
+        static WATCH_FRAME: AtomicU64 = AtomicU64::new(0);
+        let watch = texture_watch() && heap_recheck();
+        let early = if watch
+            && !only
+            && SPENT.load(Ordering::Relaxed) < bytes_at_most
+            && WATCH_FRAME.fetch_max(frame + 1, Ordering::Relaxed) <= frame
+        {
+            let started = std::time::Instant::now();
+            let slots = host.texture_slots_early(frame, WATCH_SLOTS);
+            crate::framelog::add(crate::framelog::T::TextureWatchUs, started.elapsed().as_micros() as u64);
+            slots
+        } else {
+            Vec::new()
+        };
         let began = std::time::Instant::now();
-        for (index, write) in due {
+        let slots = early.into_iter().map(|slot| (slot, true)).chain(due.into_iter().map(|slot| (slot, false)));
+        for ((index, write), early) in slots {
             // A run for a bake draw's own ends at its own bytes, not at the
             // frame's budget or time.
             if only {
@@ -2882,33 +2906,52 @@ impl State {
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at again in the
             // next frame with `VICTORY_RECHECK_SOON=1` ([`recheck_soon`]).
+            let early_started = early.then(std::time::Instant::now);
+            let checked = if early {
+                let Some(checked) = host.texture_slot_claim_early(index, write, frame) else {
+                    continue;
+                };
+                Some(checked)
+            } else {
+                host.texture_slot_checked(index)
+            };
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
-                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+            let mut changed = None;
+            if let Some((at, len, print, looks, uploaded)) = checked {
+                let current = crate::texture::fingerprint(at, len);
+                if let Some(started) = early_started {
+                    crate::framelog::add(crate::framelog::T::TextureWatchUs, started.elapsed().as_micros() as u64);
+                }
+                if current == print {
+                    if !early {
+                        HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                        match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                            Some(wait) => host.texture_slot_recheck(
+                                index, write, frame + wait, (at, len), print, looks + 1, uploaded, None,
+                            ),
+                            None => host.texture_slot_done(index, write, None),
                         }
-                        None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                changed = Some((at, len, current));
                 if recheck_soon() {
                     again_in = 1;
                 }
-                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 200 || n.is_multiple_of(1000) {
-                    tracing::warn!(
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        looked_at_next_frame = HEAP_TEXTURES_SOON.load(Ordering::Relaxed),
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                if !early {
+                    let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    if n < 200 || n.is_multiple_of(1000) {
+                        tracing::warn!(
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            looked_at_next_frame = HEAP_TEXTURES_SOON.load(Ordering::Relaxed),
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;
@@ -3101,14 +3144,26 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            if early && bytes != 0 {
+                crate::framelog::add(crate::framelog::T::TextureWatchUploads, 1);
+                crate::framelog::add(crate::framelog::T::TextureWatchBytes, bytes);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    // Keep the fingerprint that triggered this early upload. A write
+                    // between that check and recording the upload stays detectable.
+                    let print = match changed {
+                        Some((start, size, print)) if early && (start, size) == (at, len) => print,
+                        _ => crate::texture::fingerprint(at, len),
+                    };
                     if again_in != RECHECK_FRAMES[0] {
                         HEAP_TEXTURES_SOON.fetch_add(1, Ordering::Relaxed);
                     }
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    let next_early = if watch && changed.is_some() && len <= WATCH_BYTES { frame + 1 } else { 0 };
+                    host.texture_slot_recheck(
+                        index, write, frame + again_in, (at, len), print, 0, frame, Some(next_early),
+                    );
                 }
                 None => host.texture_slot_done(index, write, again),
             }

@@ -730,6 +730,20 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// Next optional early fingerprint check, or 0.
+    early: u64,
+}
+
+/// Frames of extra looks after an ordinary fingerprint found a change.
+const EARLY_TEXTURE_FRAMES: u64 = 12;
+
+impl Waiting {
+    fn early_due(&self, frame: u64) -> bool {
+        self.early != 0
+            && self.early <= frame
+            && frame < self.due
+            && frame.saturating_sub(self.checked.4) <= EARLY_TEXTURE_FRAMES
+    }
 }
 
 thread_local! {
@@ -761,7 +775,10 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(
+            index,
+            Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), early: 0 },
+        );
     }
 
     fn remove(&mut self, index: u32) {
@@ -821,6 +838,7 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            w.early = 0;
         }
     }
 
@@ -837,6 +855,7 @@ impl TextureQueue {
     fn hold(&mut self, index: u32, write: u64, due: u64) {
         if let Some(w) = self.same(index, write) {
             w.due = w.due.max(due);
+            w.early = 0;
             self.held.insert(index, write);
         }
     }
@@ -860,6 +879,7 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.early = 0;
         }
     }
 
@@ -868,11 +888,54 @@ impl TextureQueue {
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+        early: Option<u64>,
+    ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            if let Some(early) = early {
+                w.early = early;
+            }
         }
+    }
+
+    /// Candidates for optional checks that are not yet due for their ordinary look.
+    /// Serve the oldest unchecked candidate first, keeping at most `max` entries.
+    fn early(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut oldest = std::collections::BinaryHeap::new();
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.early_due(frame)) {
+            let candidate = (w.early, index, w.write);
+            if oldest.len() < max {
+                oldest.push(candidate);
+            } else if let Some(mut newest) = oldest.peek_mut()
+                && candidate < *newest
+            {
+                *newest = candidate;
+            }
+        }
+        oldest.into_sorted_vec().into_iter().map(|(_, index, write)| (index, write)).collect()
+    }
+
+    /// Claims one early look for this frame if the descriptor still has the same write.
+    fn claim_early(&mut self, index: u32, write: u64, frame: u64) -> Option<(u64, u64, u64, u8, u64)> {
+        let w = self.same(index, write)?;
+        if !w.early_due(frame) {
+            return None;
+        }
+        w.early = frame + 1;
+        Some(w.checked)
     }
 
     /// Of the slots `indices`, the ones that wait for their upload, due or
@@ -917,7 +980,10 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(
+            index,
+            Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), early: 0 },
+        );
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1452,9 +1518,18 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        early: Option<u64>,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, early);
+    }
+
+    pub(crate) fn texture_slots_early(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).early(frame, max)
+    }
+
+    pub(crate) fn texture_slot_claim_early(&self, index: u32, write: u64, frame: u64) -> Option<(u64, u64, u64, u8, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).claim_early(index, write, frame)
     }
 
     /// See [`TextureQueue::checked`].
@@ -4421,6 +4496,58 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+    #[test]
+    fn early_texture_checks_are_bounded_and_keep_the_ordinary_due_date() {
+        let mut q = TextureQueue::default();
+        for index in [1, 2, 3, 4] {
+            q.written(index, 10, 10, false);
+        }
+        let memory = (0x1000, 4096);
+        q.recheck(1, 1, 14, memory, 11, 0, 10, Some(11));
+        q.recheck(2, 2, 14, memory, 21, 0, 10, Some(11));
+        q.recheck(3, 3, 14, memory, 31, 0, 10, Some(11));
+        q.recheck(4, 4, 14, memory, 41, 0, 10, None);
+
+        assert!(q.early(10, 2).is_empty());
+        assert_eq!(q.early(11, 2), [(1, 1), (2, 2)]);
+        assert_eq!(q.claim_early(1, 1, 11), Some((memory.0, memory.1, 11, 0, 10)));
+        assert!(q.claim_early(1, 1, 11).is_none());
+        assert!(q.due(11, 4).is_empty());
+        assert_eq!(q.early(12, 2), [(2, 2), (3, 3)]);
+        assert!(q.early(14, 4).is_empty());
+        assert_eq!(q.due(14, 4).len(), 4);
+
+        // An ordinary look that found the same bytes preserves the early window.
+        q.recheck(1, 1, 26, memory, 11, 1, 10, None);
+        assert_eq!(q.early(22, 4), [(1, 1)]);
+        assert!(q.early(23, 4).is_empty());
+    }
+
+    #[test]
+    fn early_texture_checks_follow_the_current_upload_and_stop_when_held() {
+        let mut q = TextureQueue::default();
+        q.written(1, 10, 10, false);
+        let memory = (0x1000, 4096);
+        q.recheck(1, 1, 14, memory, 11, 0, 10, Some(11));
+        assert!(q.claim_early(1, 1, 11).is_some());
+
+        // A changed fingerprint and a successful upload start a new window.
+        q.recheck(1, 1, 15, memory, 12, 0, 11, Some(12));
+        assert_eq!(q.claim_early(1, 1, 12), Some((memory.0, memory.1, 12, 0, 11)));
+        q.hold(1, 1, 30);
+        assert!(q.early(13, 1).is_empty());
+        assert_eq!(q.room(13), 1);
+        assert_eq!(q.due(13, 1), [(1, 1)]);
+
+        q.recheck(1, 1, 18, memory, 13, 0, 14, Some(15));
+        assert_eq!(q.early(15, 1), [(1, 1)]);
+        q.changed(1, 15, 15);
+        assert!(q.claim_early(1, 1, 15).is_none());
+        q.recheck(1, 1, 19, memory, 14, 0, 15, Some(16));
+        assert!(q.early(16, 1).is_empty());
+        assert_eq!(q.due(15, 1), [(1, 2)]);
+    }
+
     /// Slots held back for lack of room on the card are not handed out
     /// until their frame, keep their place, are not counted as waiting
     /// for their memory, and all come back at once when the card has room;
@@ -4471,7 +4598,7 @@ mod tests {
         let named = |q: &TextureQueue| -> Vec<u32> { q.queued(&[5, 6, 7, 8]).into_iter().map(|d| d.0).collect() };
         assert_eq!(named(&q), [5, 6, 7]);
         assert_eq!(q.queued(&[7]), [(7, write(7))], "with the write the pass hands back");
-        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1);
+        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1, None);
         assert_eq!(named(&q), [6, 7]);
         let six = q.queued(&[6]);
         q.requeue(&[5, 6, 8], 3);
