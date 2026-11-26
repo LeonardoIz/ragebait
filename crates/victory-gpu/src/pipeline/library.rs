@@ -396,6 +396,8 @@ struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Blob,
+    /// Whether saving can preserve any rejected file from this run.
+    can_save_binary: bool,
     /// Pipelines stored since the last save.
     added: AtomicU64,
     /// Stores share it and a save takes it alone: the size the library
@@ -452,8 +454,9 @@ fn library() -> Option<&'static Library> {
                 return None;
             }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let dir = DIR.get().map(PathBuf::as_path);
+            let blob = dir.map_or(Blob::None, Blob::of);
+            let library = open(&device, blob, dir);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -464,7 +467,7 @@ fn library() -> Option<&'static Library> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: Blob, dir: Option<&std::path::Path>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -486,13 +489,14 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 return Some(Library {
                     library,
                     _blob: blob,
+                    can_save_binary: true,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
                 });
             }
             Err(e) => {
                 rejected = true;
-                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one");
             }
         }
     } else {
@@ -506,16 +510,19 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // RenderDoc's device refused the card's library, an empty one was
     // saved over 366 MB of built pipelines, and the next run drew black
     // until they were built again).
+    let mut can_save_binary = true;
     if rejected
-        && let Some(dir) = DIR.get()
+        && let Some(dir) = dir
         && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE))
     {
-        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        can_save_binary = false;
+        tracing::warn!(error = %e, "could not quarantine the rejected host pipeline library; binary saves disabled for this run");
     }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
+        can_save_binary,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
@@ -615,7 +622,11 @@ pub(crate) fn save(now: bool) {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
-        let added = library.added.load(Ordering::Relaxed);
+        let added = if library.can_save_binary {
+            library.added.load(Ordering::Relaxed)
+        } else {
+            0
+        };
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
@@ -777,10 +788,28 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
+        let library =
+            open(&device, Blob::Held(b"not a pipeline library".repeat(16)), None).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+        assert!(library.can_save_binary);
+    }
+
+    #[test]
+    fn failed_quarantine_disables_binary_saves() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let rejected = b"not a pipeline library".repeat(16);
+        std::fs::write(&path, &rejected).unwrap();
+        // A directory at the destination prevents renaming the rejected file.
+        std::fs::create_dir(dir.path().join(REJECTED_FILE)).unwrap();
+        let library = open(&device, Blob::of(dir.path()), Some(dir.path())).expect("an empty library");
+        assert!(!library.can_save_binary);
+        assert_eq!(std::fs::read(&path).unwrap(), rejected);
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
