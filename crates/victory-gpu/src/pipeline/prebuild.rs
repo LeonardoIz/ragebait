@@ -485,15 +485,13 @@ fn replay(
     } else {
         let rebuilt =
             rebuild(&d.portable, &containers).ok_or("the stream does not fit its shaders")?;
-        let mut g = GraphicsState::default();
         let own = |stage, code: &Bytecode| {
             // SAFETY: the code points into `containers`.
             (!code.code.is_null() && code.size != 0)
                 .then(|| own(stage, unsafe { std::slice::from_raw_parts(code.code, code.size) }))
         };
-        // SAFETY: a whole subobject lies at `at`, its pointers at `rebuilt`'s own data.
-        let shaders =
-            super::read_stream(&rebuilt.stream, own, |kind, at| unsafe { g.read(kind, at) });
+        // SAFETY: the pointers are at `rebuilt`'s own data.
+        let (shaders, g) = unsafe { super::read_graphics(&rebuilt.stream, own) };
         (shaders, Some(Box::new(g)))
     };
     if super::make::key(&shaders, graphics.as_deref()) != d.key {
@@ -616,17 +614,16 @@ mod tests {
         s
     }
 
+    /// The key the run gives the title's stream.
     fn title_key(stream: &[u8]) -> String {
-        let mut g = GraphicsState::default();
         let own = |stage, code: &Bytecode| {
             // SAFETY: the test's live code.
             Some(own(stage, unsafe {
                 std::slice::from_raw_parts(code.code, code.size)
             }))
         };
-        // SAFETY: whole subobjects with live pointers.
-        let shaders =
-            super::super::read_stream(stream, own, |kind, at| unsafe { g.read(kind, at) });
+        // SAFETY: live pointers.
+        let (shaders, g) = unsafe { super::super::read_graphics(stream, own) };
         super::super::make::key(&shaders, Some(&g))
     }
 
@@ -726,6 +723,50 @@ mod tests {
         assert_eq!(recorded_settings(dir.path()), Some([2; 8]));
         assert_eq!(read_all(dir.path()).0.len(), 2);
         assert_eq!(settings(), settings());
+    }
+
+    /// A blended pipeline into a float and a second target (`format`, DXGI
+    /// numbering): one blend state for all targets.
+    fn blended(vs: &[u8], ps: &[u8], format: u32) -> Vec<u8> {
+        let mut s = stream(vs, ps, &[], 3);
+        let mut blend = vec![0u8; 336];
+        blend[..4].copy_from_slice(&8u32.to_le_bytes());
+        blend[12..16].copy_from_slice(&1u32.to_le_bytes()); // target 0 blends
+        blend[20..24].copy_from_slice(&5u32.to_le_bytes()); // source alpha
+        let mut targets = vec![0u8; 40];
+        targets[..4].copy_from_slice(&15u32.to_le_bytes());
+        targets[4..8].copy_from_slice(&10u32.to_le_bytes()); // R16G16B16A16_FLOAT
+        targets[8..12].copy_from_slice(&format.to_le_bytes());
+        targets[36..40].copy_from_slice(&2u32.to_le_bytes());
+        s.extend(blend);
+        s.extend(targets);
+        s
+    }
+
+    /// The run turns blending off for integer targets before the key; the
+    /// replay does the same, so a recorded pipeline gives its key again.
+    #[test]
+    fn blended_float_and_integer_targets_replay_to_their_key() {
+        let (vs, ps) = (vec![9u8; 8], vec![1u8; 8]);
+        let shaders = || vec![own("vertex", &vs), own("pixel", &ps)];
+        // A second float target, then R8G8B8A8_UINT.
+        let (float, integer) = (blended(&vs, &ps, 10), blended(&vs, &ps, 30));
+        let dir = tempfile::tempdir().unwrap();
+        append(
+            dir.path(),
+            vec![
+                (description(&float, &vs, &ps), shaders()),
+                (description(&integer, &vs, &ps), shaders()),
+            ],
+            [1; 8],
+        );
+        let all = read_all(dir.path()).0;
+        assert_eq!(all.len(), 2);
+        for d in &all {
+            let (_, graphics) = replay(dir.path(), d).unwrap();
+            // Already as the host takes it: nothing left to turn off.
+            assert!(!graphics.unwrap().integer_targets_do_not_blend());
+        }
     }
 
     /// The key depends on what the pipeline is, not where the title kept
