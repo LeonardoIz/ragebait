@@ -213,7 +213,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        if retire_lean() && !reaper_on() {
+        if !reaper_on() {
             // Dropped here, as `reap` would, without a list made for it.
             drop(object);
             return;
