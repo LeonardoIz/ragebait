@@ -592,6 +592,7 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
     let last_save = Mutex::new(std::time::Instant::now());
     let (next, made, loaded) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let denied = AtomicU64::new(0);
     let failed: Mutex<BTreeMap<&str, u64>> = Mutex::new(BTreeMap::new());
     // Without a run's log lines per shader and pipeline: thousands of them.
     let quiet = tracing::Dispatch::none();
@@ -599,6 +600,10 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
         for _ in 0..threads.clamp(1, all.len().max(1)) {
             s.spawn(|| {
                 while let Some(d) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if super::make::denied(d.shaders.iter().map(|(_, hash)| hash.as_str())).is_some() {
+                        denied.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let outcome = replay(dir, d).and_then(|(shaders, graphics)| {
                         let pipeline = tracing::dispatcher::with_default(&quiet, || {
                             HostPipeline::new(&shaders, graphics.as_deref())
@@ -639,8 +644,10 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
     });
     super::library::save(true);
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    let denied = denied.into_inner();
+    let denied = if denied > 0 { format!(", denied {denied}") } else { String::new() };
     let summary = format!(
-        "pipeline prebuild: {} recorded, prebuilt {}, loaded from cache {}, failed {}, {:.1} s{}",
+        "pipeline prebuild: {} recorded, prebuilt {}, loaded from cache {}, failed {}{denied}, {:.1} s{}",
         all.len(),
         made.into_inner(),
         loaded.into_inner(),
