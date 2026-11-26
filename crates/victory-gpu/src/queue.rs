@@ -1559,7 +1559,9 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    let mut ok = true;
+    // All of them in one call to the runtime, which may take its mapping
+    // lock once for them (`VICTORY_REMAP_FAST`).
+    let (mut ok, mut maps) = (true, Vec::new());
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1571,16 +1573,18 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
+            let page_map = |from, repeat| crate::resource::PageMap { to: at, from, len, repeat };
+            match r.kind {
+                0 if inside(r.count) => maps.push(page_map(source, false)),
+                1 if inside(1) => maps.push(page_map(source, true)),
+                2 => maps.push(page_map(0, false)),
+                3 => {}
+                _ => ok = false,
+            }
             at += len;
         }
     }
+    ok &= map(&maps);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
