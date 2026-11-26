@@ -282,4 +282,22 @@ mod tests {
         crate::title_memory_remapped(0x7_8000, 0x1000);
         assert!(!ticket.valid.load(Ordering::Acquire));
     }
+
+    /// A reset of one page of a view that stays mapped (`victory-hle`
+    /// `xmem`, `VICTORY_MAP_RUNS`) leaves a copy-back on another page of it
+    /// alone, and the view stays known whole.
+    #[cfg(windows)]
+    #[test]
+    fn a_refresh_of_one_page_keeps_copy_backs_beside_it() {
+        const K64: usize = 64 << 10;
+        const VIEW: usize = 0x7a_0000_0000;
+        crate::inplace::title_memory_view(VIEW, 3 * K64, 96, 0);
+        let ticket = track(96, VIEW + 2 * K64 + 0x100, VIEW + 2 * K64 + 0x200);
+        crate::inplace::title_memory_refreshed(VIEW, 3 * K64, 96, 0, VIEW, K64);
+        assert!(ticket.valid.load(Ordering::Acquire));
+        assert_eq!(crate::inplace::views_between(VIEW, VIEW + 1), [(VIEW, 3 * K64)]);
+        assert_eq!(crate::inplace::pages_of(VIEW + 2 * K64), [VIEW + 2 * K64]);
+        crate::title_memory_remapped(VIEW, 3 * K64);
+        assert!(!ticket.valid.load(Ordering::Acquire));
+    }
 }

@@ -737,12 +737,34 @@ pub(crate) fn before_sync() {
 
 #[cfg(windows)]
 fn release_held_now(all: bool) {
+    release_held_in(all, true);
+}
+
+/// [`release_held`] for a thread blocked on a fence (`crate::fence`): it
+/// returns at once while another thread releases, instead of waiting for it.
+#[cfg(windows)]
+pub(crate) fn try_release_held() {
+    if behind() {
+        wake();
+        return;
+    }
+    release_held_in(false, false);
+}
+
+/// [`release_held_now`]; without `wait`, nothing if another thread is at it.
+#[cfg(windows)]
+fn release_held_in(all: bool, wait: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
-    let _one = lock(&RELEASING);
+    let _one = match RELEASING.try_lock() {
+        Ok(one) => one,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) if !wait => return,
+        Err(std::sync::TryLockError::WouldBlock) => lock(&RELEASING),
+    };
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {
