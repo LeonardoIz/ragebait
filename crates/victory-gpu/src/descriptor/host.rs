@@ -2752,6 +2752,13 @@ fn twin_uav(
     Some(desc)
 }
 
+const MAX_CBV: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+
+fn constant_view_size(size: u32) -> u32 {
+    // Cap before rounding so sizes near u32::MAX cannot overflow.
+    size.min(MAX_CBV).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2770,7 +2777,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             // D3D12 refuses a CBV over 64 KiB (4096 16-byte elements), and a
             // release build can lose the device for it; no shader reads past that.
-            const MAX_CBV: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
             if size > MAX_CBV {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -2780,7 +2786,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256).min(MAX_CBV),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3172,6 +3178,11 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_view_size_caps_before_rounding() {
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
