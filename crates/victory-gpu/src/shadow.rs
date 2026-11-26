@@ -2088,6 +2088,48 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Title address ranges of the pages `stale` (page number, asking taken
+/// at, in page order): whole pages, or with `parts` (one mask for each, a
+/// bit for each 4 KiB; empty: all whole) only the parts set; ranges side
+/// by side joined.
+fn part_ranges(stale: &[(usize, u64)], parts: &[u16]) -> Vec<(usize, usize)> {
+    const PART: usize = PAGE / 16;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut push = |a: usize, b: usize| match out.last_mut() {
+        Some(last) if last.1 == a => last.1 = b,
+        _ => out.push((a, b)),
+    };
+    for (i, &(page, _)) in stale.iter().enumerate() {
+        match parts.get(i) {
+            Some(&mask) if mask != u16::MAX => {
+                for k in (0..16).filter(|k| mask >> k & 1 != 0) {
+                    push(page * PAGE + k * PART, page * PAGE + (k + 1) * PART);
+                }
+            }
+            _ => push(page * PAGE, (page + 1) * PAGE),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::{PAGE, part_ranges};
+
+    #[test]
+    fn stale_pages_are_cut_to_their_written_parts() {
+        const P: usize = PAGE / 16;
+        let stale = [(10, 5), (11, 5), (12, 0), (14, 6)];
+        // Without parts: runs of whole pages.
+        assert_eq!(part_ranges(&stale, &[]), [(10 * PAGE, 13 * PAGE), (14 * PAGE, 15 * PAGE)]);
+        let at = |page: usize, part: usize| page * PAGE + part * P;
+        assert_eq!(
+            part_ranges(&stale, &[0b1000_0000_0000_0011, 0b1, u16::MAX, 0]),
+            [(at(10, 0), at(10, 2)), (at(10, 15), at(11, 1)), (at(12, 0), at(13, 0))]
+        );
+    }
+}
+
 /// The kernel's page: the unit [`land_echo`] compares.
 const KERNEL_PAGE: usize = 4096;
 
@@ -3833,12 +3875,15 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), whole pages within the buffer; with
+    /// `crate::watch::parts_on`, of a page taken before only the 4 KiB parts
+    /// written since.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // Stale pages and the asking each was taken at before.
+        let mut stale: Vec<(usize, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3850,20 +3895,29 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                stale.push((page, *at));
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
+        let parts = if crate::watch::parts_on() { crate::watch::parts_written(&stale) } else { Vec::new() };
+        let ranges = part_ranges(&stale, &parts);
+        if !parts.is_empty() {
+            let whole: usize = parts.iter().filter(|&&p| p != u16::MAX).count() * PAGE;
+            let taken: usize = parts.iter().filter(|&&p| p != u16::MAX).map(|p| p.count_ones() as usize * (PAGE / 16)).sum();
+            crate::framelog::add(crate::framelog::T::PagePartsLeft, (whole - taken) as u64);
+        }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        let mut bytes = 0;
+        for (a, b) in ranges {
+            let (a, b) = (a.max(from), b.min(to));
+            if a < b {
+                bytes += self.copy(a, b);
+            }
         }
         bytes
     }
