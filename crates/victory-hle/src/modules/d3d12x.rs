@@ -49,6 +49,19 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// The offline pipeline pre-build: see `victory_gpu::pipeline::prebuild_pipelines`.
+pub fn prebuild_pipelines(threads: usize) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::prebuild_pipelines(threads)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = threads;
+        Err("no host pipelines on this host".into())
+    }
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

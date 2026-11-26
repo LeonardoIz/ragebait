@@ -92,6 +92,16 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Make the title pipelines earlier runs recorded
+    /// (`VICTORY_PSO_PREBUILD=1`) into the host pipeline library, so the
+    /// next run loads them instead of compiling them. Run it with the
+    /// title closed, after a driver or translator change. The host device
+    /// sets the translation up as a run's does.
+    Prebuild {
+        /// Worker threads (default: half the logical cores, 2 to 8).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -173,6 +183,16 @@ fn main() -> Result<()> {
                 return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Prebuild { jobs } => {
+            let cfg = victory_core::Config::load()?;
+            victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+            let threads = jobs.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            });
+            let summary = victory_hle::modules::d3d12x::prebuild_pipelines(threads).map_err(anyhow::Error::msg)?;
+            println!("{summary}");
+            Ok(())
         }
         Command::Run {
             exe,
