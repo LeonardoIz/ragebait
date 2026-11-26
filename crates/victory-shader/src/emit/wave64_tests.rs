@@ -136,6 +136,31 @@ fn lowered_on(
 }
 
 #[test]
+fn scalar_select_reads_mask_scc_across_host_waves() {
+    let native = native(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x8507_8081, // s_cselect_b32 s7, 1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let select = p.blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.name() == "s_cselect_b32")
+        .expect("scalar select");
+    assert!(lower::reads_mask_as_data(&st, select));
+    let mut shader = lowered(&native, &p, &HashSet::new()).expect("Wave32 lowering");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+}
+
+#[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd
     // mantissas, so that additions round); all of them store the wave's sum
