@@ -36,6 +36,10 @@ cargo test --workspace --locked
 cargo xtask policy
 ```
 
+If a parallel test gate fails, rerun it with `-- --test-threads=1`. If
+the serial run passes, bisect the test set with filters, keeping parallel
+execution enabled to isolate the tests that interact.
+
 The pre-commit hook (`cargo xtask install-hooks`) runs the policy check. If the
 repository folder was moved, run `cargo clean` first: `xtask` bakes in its
 source path.

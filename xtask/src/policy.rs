@@ -27,14 +27,16 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
-/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[
+/// Approved paths, BLAKE3 digests, and reasons for the exceptions.
+const EXCEPTIONS: &[(&str, &str, &str)] = &[
     (
         "crates/victory-formats/src/bcpack-tables.bin",
+        "f0f032aa310e7cfd431c075d2816decdd39d21b1927cbffc38386599c0de73c0",
         "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
     ),
     (
         "docs/logo.png",
+        "3941f0c542277f979ed06cd85dc5601239092275ac4ee568fc10ad4ced08cc81",
         "ragebait's own logo for the README banner: our artwork, nothing from the game (owner's decision, 2026-11-26)",
     ),
 ];
@@ -58,9 +60,6 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
     for path in &files {
-        if EXCEPTIONS.iter().any(|(p, _)| p == path) {
-            continue;
-        }
         let content = if staged {
             let out = Command::new("git")
                 .args(["show", &format!(":{path}")])
@@ -150,13 +149,21 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
-    let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
-        || ext
-            .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name == "victory.toml" || lower_name.contains(".local.") {
+        return vec!["local configuration may not be committed".to_owned()];
+    }
+    if let Some((_, digest, _)) = EXCEPTIONS.iter().find(|(p, _, _)| *p == path) {
+        if blake3::hash(content).to_hex().as_str() == *digest {
+            return Vec::new();
+        }
+        return vec!["BLAKE3 digest does not match the approved exception".to_owned()];
+    }
+    let mut problems = Vec::new();
+    let ext = lower_name.rsplit_once('.').map(|(_, e)| e);
+    let allowed =
+        ALLOWED_NAMES.contains(&name) || ext.is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
@@ -202,6 +209,31 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("victory.example.toml", b"# example\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_local_configuration_by_path() {
+        for path in [
+            "victory.toml",
+            "config/VICTORY.TOML",
+            "config/tool.local.json",
+        ] {
+            assert_eq!(
+                check(path, b""),
+                ["local configuration may not be committed"]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_replacement_exception_content() {
+        for (path, _, _) in super::EXCEPTIONS {
+            assert_eq!(
+                check(path, b"replacement content"),
+                ["BLAKE3 digest does not match the approved exception"]
+            );
+        }
     }
 
     #[test]

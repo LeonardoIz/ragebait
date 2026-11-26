@@ -1,9 +1,8 @@
 //! Platform-level data formats, shared by every Xbox Series title.
 //!
-//! Each module is pure (bytes in, bytes out, no I/O): [`texture`] (the
-//! GPU's tiled texture layouts and copies to and from linear rows). Planned:
-//! BCPack textures, audio codecs (XMA2, Opus), and the zlib streams used by
-//! hardware decompression.
+//! Each module is pure (bytes in, bytes out, no I/O): [`texture`] for the
+//! GPU's tiled texture layouts and copies to and from linear rows,
+//! [`bcpack`] for BCPack textures, and [`xma`] for XMA2 audio.
 
 pub mod bcpack;
 pub mod texture;
