@@ -299,6 +299,10 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        #[cfg(windows)]
+        if victory_gpu::remap_stats::on() {
+            victory_gpu::remap_stats::log_summary();
+        }
     }
     host::terminate_process(process, code)
 }

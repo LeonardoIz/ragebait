@@ -286,6 +286,9 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    if victory_gpu::remap_stats::on() {
+        victory_gpu::remap_stats::log_summary();
+    }
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

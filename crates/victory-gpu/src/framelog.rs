@@ -179,6 +179,10 @@ pub enum T {
 const N: usize = T::Count as usize;
 static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
+pub(crate) fn total(t: T) -> u64 {
+    TOTAL[t as usize].load(Relaxed)
+}
+
 /// Adds to a total.
 pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
@@ -657,7 +661,11 @@ const LONG_MOST: usize = 8;
 /// A frame ends: called at the end of the title's present call, on the
 /// thread that made it.
 pub fn frame() {
-    if !on() {
+    let log = on();
+    if crate::remap_stats::on() {
+        crate::remap_stats::frame(log);
+    }
+    if !log {
         return;
     }
     crate::cardmeter::collect();
