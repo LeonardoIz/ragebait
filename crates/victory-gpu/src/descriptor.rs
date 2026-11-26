@@ -203,6 +203,12 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        if sync_threads() > 1 && page_at_once() {
+            let taken = written.take(start as usize, end as usize);
+            let [p, seen, made] = sync_pages_spread(host, &taken, (start, step), mirrored_count, sync_threads());
+            (pages, looked, mirrored) = (pages + p, looked + seen, mirrored + made);
+            continue;
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -249,9 +255,98 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let micros = started.elapsed().as_micros() as u64;
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros]) {
         count.fetch_add(n, Relaxed);
     }
+    crate::framelog::add(crate::framelog::T::HeapSyncUs, micros);
+    crate::framelog::add(crate::framelog::T::HeapSyncPages, pages);
+}
+
+/// The threads [`sync_heaps`] reads and compares a heap's changed pages on
+/// (`VICTORY_SYNC_THREADS=<n>`; unset, 0 or 1: the submitting thread alone,
+/// as before; at most 16). After cgbj 44629de. 4 suits a processor of 16
+/// logical processors: the title's own threads keep most of them busy.
+/// What is mirrored, and in what order, is the same either way; the
+/// changed records are made after, on the calling thread. The frame log's
+/// heap pass time shows the effect, and its pages "read beside" how many
+/// pages the other threads took.
+#[cfg(windows)]
+fn sync_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_SYNC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16))
+}
+
+/// Pages [`sync_pages_spread`] gives a thread at a time.
+#[cfg(windows)]
+const SYNC_PAGES: usize = 8;
+
+/// [`sync_heaps`]' pages of one heap (`taken`, its changed byte ranges;
+/// its records at `start + i * step`) read and compared on up to `threads`
+/// threads, the calling one among them, [`SYNC_PAGES`] at a time; then the
+/// changed records mirrored here in page order, as one thread does it.
+/// Returns the pages read, the records looked at and those mirrored.
+#[cfg(windows)]
+fn sync_pages_spread(
+    host: &host::HostHeap,
+    taken: &[(usize, usize)],
+    (start, step): (u64, u64),
+    mirrored_count: u32,
+    threads: usize,
+) -> [u64; 3] {
+    let mut parts: Vec<(usize, usize)> = Vec::new();
+    for &(range_from, range_end) in taken {
+        let mut page = range_from & !(crate::watch::PAGE - 1);
+        while page < range_end {
+            parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
+            page += crate::watch::PAGE;
+        }
+    }
+    let chunks: Vec<&[(usize, usize)]> = parts.chunks(SYNC_PAGES).collect();
+    // Per chunk: pages read, records looked at, slots to mirror.
+    type Found = (u64, u64, Vec<(u32, u64)>);
+    let found: Vec<std::sync::Mutex<Found>> = chunks.iter().map(|_| std::sync::Mutex::default()).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = |beside: bool| {
+        let mut page_bytes: Vec<u8> = Vec::new();
+        loop {
+            let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(chunk) = chunks.get(n) else { break };
+            let mut out: Found = (0, 0, Vec::new());
+            for &(from, to) in *chunk {
+                // Read through the kernel, as `sync_heaps` reads them.
+                page_bytes.resize(to - from, 0);
+                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    continue;
+                }
+                out.0 += 1;
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                let (seen, due) = host.copied_page_due(slots, (start, step), from, &page_bytes);
+                out.1 += seen;
+                out.2.extend(due);
+            }
+            if beside {
+                crate::framelog::add(crate::framelog::T::HeapSyncPagesBeside, out.0);
+            }
+            *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
+        }
+    };
+    let helpers = (threads - 1).min(chunks.len().saturating_sub(1));
+    std::thread::scope(|s| {
+        for _ in 0..helpers {
+            // (A thread the system refuses leaves its pages to the others.)
+            let _ = std::thread::Builder::new().name("victory-heap-pages".into()).spawn_scoped(s, || work(true));
+        }
+        work(false);
+    });
+    let (mut pages, mut looked, mut due) = (0, 0, Vec::new());
+    for part in found {
+        let (p, seen, mut d) = part.into_inner().unwrap_or_else(|e| e.into_inner());
+        (pages, looked) = (pages + p, looked + seen);
+        due.append(&mut d);
+    }
+    host.mirror_due(&due);
+    [pages, looked, due.len() as u64]
 }
 
 /// Whether a submission's pass over the title's view heaps ([`sync_heaps`])
@@ -1033,7 +1128,6 @@ pub(crate) fn forget(resource: usize) {
 
 /// The record at `handle` (a descriptor slot in title memory): its tag and
 /// two words, read as they are.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn record_at(handle: u64) -> [u32; 3] {
     // SAFETY: the handle is a descriptor slot in title memory, at least 16
     // bytes.
@@ -1172,12 +1266,32 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        let same = same_records() && unsafe {
+            std::slice::from_raw_parts(src as *const u8, len as usize) == std::slice::from_raw_parts(dst as *const u8, len as usize)
+        };
+        if same {
+            #[cfg(windows)]
+            crate::framelog::add(crate::framelog::T::SameRecords, 1);
+        } else {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
     }
+}
+
+/// Whether a descriptor copy whose destination already holds the source's
+/// bytes is left unwritten (`VICTORY_SAME_RECORDS=1`; off by default:
+/// written, as before). After cgbj e8d3d91. The write changes nothing but
+/// dirties the heap's write-watched page, and [`sync_heaps`] then reads and
+/// compares every record on it. The slots are mirrored either way.
+/// `crate::framelog::T::SameRecords` counts the copies left alone.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -1466,6 +1580,33 @@ pub(crate) mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// Pages read on several threads (`VICTORY_SYNC_THREADS`) mirror every
+    /// changed record, each once.
+    #[cfg(windows)]
+    #[test]
+    fn records_read_on_several_threads_are_all_made() {
+        let mut memory = vec![0u8; 64 * 16];
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let start = memory.as_mut_ptr() as u64;
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: start, size: 64 * 16 }, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            let mut taken = Vec::new();
+            // Twenty slots, each its own range: three parts of the pages.
+            for slot in 5..25usize {
+                create_sampler(std::ptr::null(), &sampler, start + slot as u64 * 16);
+                taken.push((start as usize + slot * 16, start as usize + slot * 16 + 16));
+            }
+            // The calls made them; the pass finds them new all the same.
+            assert_eq!(sync_pages_spread(host, &taken, (start, 16), 64, 4), [20, 20, 20]);
+            assert!((5..25).all(|slot| host.made(slot)));
+            // Seen now: nothing is mirrored again.
+            assert_eq!(sync_pages_spread(host, &taken, (start, 16), 64, 4), [20, 20, 0]);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     #[test]

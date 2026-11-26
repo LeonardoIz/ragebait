@@ -565,9 +565,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
-    /// Diagnostics: the number of this recording of the list, by which the
-    /// tables it makes twice are told ([`table_asked`]); 0 until its first.
-    #[cfg(feature = "diagnostics")]
+    /// The number of this recording of the list, by which the views its
+    /// tables hold are made once (`crate::descriptor::host::list_views`)
+    /// and, in diagnostics builds, the tables it makes twice are told
+    /// ([`table_asked`]); 0 until its first fresh table.
     recording: u64,
 }
 
@@ -602,10 +603,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
-        #[cfg(feature = "diagnostics")]
-        {
-            self.recording = 0;
-        }
+        self.recording = 0;
     }
 }
 
@@ -699,6 +697,9 @@ fn seen() -> &'static [AtomicU64] {
     SEEN.get_or_init(|| (0..4 * SEEN_SLOTS).map(|_| AtomicU64::new(0)).collect())
 }
 
+/// Numbers recordings of lists ([`State::recording`]).
+static NEXT_RECORDING: AtomicU64 = AtomicU64::new(1);
+
 /// Diagnostics: counts the table of `n` records at `table` that a list in
 /// its recording number `recording` (given one here if it has none) is
 /// about to make, by where the same records were seen before ([`TABLES`] 2
@@ -713,9 +714,8 @@ fn seen() -> &'static [AtomicU64] {
 #[cfg(feature = "diagnostics")]
 fn table_asked(recording: &mut u64, table: u64, n: u32) -> Lap {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    static NEXT: AtomicU64 = AtomicU64::new(1);
     if *recording == 0 {
-        *recording = NEXT.fetch_add(1, Ordering::Relaxed);
+        *recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
     }
     let (whole, shape) = crate::descriptor::host::table_prints(table, n);
     let seen = seen();
@@ -940,6 +940,32 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// What the pass over a heap's buffer views picked by index keeps from pass
+/// to pass ([`State::heap_buffers`]): its passes, the host copy and range
+/// each slot's view reads, and the frame each copy not write-watched was
+/// last refreshed in (by the copy's number).
+#[derive(Default)]
+pub(crate) struct BufferSweep {
+    passes: u64,
+    ranges: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    whole: std::collections::HashMap<usize, u64>,
+}
+
+/// Whether the pass over buffer views picked by index is scoped to its heap
+/// (`VICTORY_BUFFER_PASS_HEAP=1`; off by default, as before). After cgbj
+/// 18bdf79 (its descriptor part). As before, one pass of the whole process
+/// runs a frame, whichever heap asks first, the one key per list makes a
+/// list that binds a second heap skip that heap's pass, the kept ranges are
+/// found by the host heap's address (a new heap at an old one's address
+/// takes its ranges) and the refresh stamps of copies not write-watched are
+/// shared by the heaps. Scoped, each host heap has its own frame stamp,
+/// ranges and stamps ([`BufferSweep`]), and a list runs the pass once per
+/// heap it binds. The frame log's "heap buffer passes" shows them.
+fn buffer_pass_scoped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_PASS_HEAP").is_some_and(|v| v == "1"))
+}
+
 /// Where the pass over textures picked by index records its uploads: into
 /// a list of the title's, or into lists of the thread that runs it ahead.
 pub(crate) enum Into<'a> {
@@ -2064,8 +2090,11 @@ impl State {
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
+        // Scoped: one per stride table, whose address is aligned (the low
+        // bit set keeps it apart from the title's resource pointers).
         const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        let scoped = buffer_pass_scoped();
+        if !list.first_use(if scoped { gpu as usize | 1 } else { ONCE }) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2079,7 +2108,7 @@ impl State {
         // of one frame is seen a frame late.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        if if scoped { &host.buffer_frame } else { &FRAME }.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -2089,14 +2118,17 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        // (Scoped: the heap's own, held to the end of the pass.)
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, BufferSweep>>> =
             std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+        let mut own = scoped.then(|| host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut kept = (!scoped).then(|| RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+        let sweep = match (&mut own, &mut kept) {
+            (Some(own), _) => &mut **own,
+            (None, Some(kept)) => kept.get_or_insert_with(Default::default).entry(std::ptr::from_ref(host) as usize).or_default(),
+            (None, None) => unreachable!(),
+        };
+        let BufferSweep { passes, ranges, whole: own_whole } = sweep;
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -2154,7 +2186,6 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -2164,8 +2195,11 @@ impl State {
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
+        let mut shared = (!scoped).then(|| WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+        let whole = match &mut shared {
+            Some(shared) => shared.get_or_insert_with(Default::default),
+            None => own_whole,
+        };
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -2188,6 +2222,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        drop((shared, kept, own));
         let textures_began = std::time::Instant::now();
         if !crate::heap_worker::kick(heap) {
             Self::heap_textures(Into::List(list), heap, host);
@@ -2195,6 +2230,8 @@ impl State {
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::HeapBufferPasses, 1);
+        crate::framelog::add(crate::framelog::T::HeapBufferUs, started.elapsed().as_micros() as u64);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -3710,6 +3747,10 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if self.recording == 0 {
+                self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
+            }
+            let listed = crate::descriptor::host::list_views().then_some(self.recording);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3730,7 +3771,15 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        // Made once in this recording, then copied
+                        // ([`crate::descriptor::host::list_views`]).
+                        let copied = listed.is_some_and(|recording| {
+                            let words = crate::descriptor::record_at(table + u64::from(k) * 32);
+                            host.make_listed(recording, words, index, &view)
+                        });
+                        if !copied {
+                            host.make_at(index, &view);
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             tally(if crate::descriptor::host::is_texture_view(&view) { 14 } else { 15 }, 1);
