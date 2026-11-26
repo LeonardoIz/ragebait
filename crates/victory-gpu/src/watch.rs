@@ -2392,14 +2392,14 @@ mod mapping_tests {
 
     #[test]
     fn kept_asking_leaves_the_range_plan_unread() {
-        let mut journal = Journal {
+        let mut journal = super::Journal {
             asked: 7,
             ahead: vec![(12, 34)],
             ahead_asked: 7,
             kept: true,
-            ..Journal::default()
+            ..super::Journal::default()
         };
-        ask_ahead_in(&mut journal, std::iter::from_fn(|| {
+        super::ask_ahead_in(&mut journal, std::iter::from_fn(|| {
             panic!("a kept asking must not consume another range plan")
         }));
         assert_eq!(journal.ahead, [(12, 34)]);
