@@ -582,32 +582,33 @@ fn emit_with_wave_wide(
         }
         other => other,
     };
-    // Check the final result after the wave-size retries, including edge threading.
-    let supported = |(shader, wave): (HostShader, Option<u32>)| {
-        if wave == Some(64) && lower::host_max_wave() == 32 {
-            Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "no wave32 lowering for this wave64 program",
-            })
-        } else {
-            Ok(shader)
-        }
+    // A wave64 program on a 32-lane host still goes to the driver as it is: a refusal there
+    // starts the wave-wide retry (`VICTORY_WAVE_WIDE_SEEN`), which a translation error would not.
+    let wave64_on_32 = |r: &Result<(HostShader, Option<u32>), ShaderError>| {
+        matches!(r, Ok((_, Some(64)))) && lower::host_max_wave() == 32
     };
-    let original = original.and_then(supported);
-    // Retry unsupported programs only. Threading can separate an unknown
-    // register value from its apparent use on a mutually exclusive path.
-    if !matches!(original, Err(ShaderError::Unsupported { .. })) {
-        return original;
+    // Retry unsupported programs, and wave64 ones on a 32-lane host. Threading can separate an
+    // unknown register value from its apparent use on a mutually exclusive path.
+    if !matches!(original, Err(ShaderError::Unsupported { .. })) && !wave64_on_32(&original) {
+        return original.map(|(shader, _)| shader);
     }
     let edges = threading::constant_edges(p, st);
     if edges.is_empty() {
-        return original;
+        return original.map(|(shader, _)| shader);
     }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+    let threaded = (|| {
+        let p = ir::thread_edges(p, &edges)?;
+        let st = structure::structure(&p)?;
+        let io = io::raise(&p, native)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        emit_program(c, native, &p, &st, &io, &res)
+    })();
+    // Keep the first result when threading gives no better one.
+    match (original, threaded) {
+        (Ok(first), Err(_)) => Ok(first.0),
+        (Ok(first), Ok(t)) if t.1 == Some(64) => Ok(first.0),
+        (_, threaded) => threaded.map(|(shader, _)| shader),
+    }
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
