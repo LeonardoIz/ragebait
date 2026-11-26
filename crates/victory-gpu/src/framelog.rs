@@ -129,6 +129,10 @@ pub enum T {
     /// Descriptor copies whose source already held what the destination
     /// did, not written (`VICTORY_SAME_RECORDS=1`).
     SameRecords,
+    /// Views fresh tables hold that a list made (in its own heap) and those
+    /// it copied from there (`VICTORY_LIST_VIEWS=1`).
+    ListViewsMade,
+    ListViewsCopied,
     Count,
 }
 
@@ -456,7 +460,7 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers; {:.0} no-ops skipped; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change          {:.1}; {:.0} views cut, {:.1} MB of them mapped again; {:.0} views mapped for {:.0} pages) | descriptors: heap pass {:.1} ms over {:.0} pages, {:.0} copies onto themselves left alone | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms |          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         readers; {:.0} no-ops skipped; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change          {:.1}; {:.0} views cut, {:.1} MB of them mapped again; {:.0} views mapped for {:.0} pages) | descriptors: heap pass {:.1} ms over {:.0} pages, {:.0} copies onto themselves left alone; list views {:.0} made, {:.0} copied | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms |          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -509,6 +513,8 @@ fn text(f: &Frame) -> String {
         ms(T::HeapSyncUs),
         t(T::HeapSyncPages),
         t(T::SameRecords),
+        t(T::ListViewsMade),
+        t(T::ListViewsCopied),
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),

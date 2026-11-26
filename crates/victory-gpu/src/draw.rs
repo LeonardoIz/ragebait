@@ -565,9 +565,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
-    /// Diagnostics: the number of this recording of the list, by which the
-    /// tables it makes twice are told ([`table_asked`]); 0 until its first.
-    #[cfg(feature = "diagnostics")]
+    /// The number of this recording of the list, by which the views its
+    /// tables hold are made once (`crate::descriptor::host::list_views`)
+    /// and, in diagnostics builds, the tables it makes twice are told
+    /// ([`table_asked`]); 0 until its first fresh table.
     recording: u64,
 }
 
@@ -602,10 +603,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
-        #[cfg(feature = "diagnostics")]
-        {
-            self.recording = 0;
-        }
+        self.recording = 0;
     }
 }
 
@@ -699,6 +697,9 @@ fn seen() -> &'static [AtomicU64] {
     SEEN.get_or_init(|| (0..4 * SEEN_SLOTS).map(|_| AtomicU64::new(0)).collect())
 }
 
+/// Numbers recordings of lists ([`State::recording`]).
+static NEXT_RECORDING: AtomicU64 = AtomicU64::new(1);
+
 /// Diagnostics: counts the table of `n` records at `table` that a list in
 /// its recording number `recording` (given one here if it has none) is
 /// about to make, by where the same records were seen before ([`TABLES`] 2
@@ -713,9 +714,8 @@ fn seen() -> &'static [AtomicU64] {
 #[cfg(feature = "diagnostics")]
 fn table_asked(recording: &mut u64, table: u64, n: u32) -> Lap {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    static NEXT: AtomicU64 = AtomicU64::new(1);
     if *recording == 0 {
-        *recording = NEXT.fetch_add(1, Ordering::Relaxed);
+        *recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
     }
     let (whole, shape) = crate::descriptor::host::table_prints(table, n);
     let seen = seen();
@@ -3710,6 +3710,10 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if self.recording == 0 {
+                self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
+            }
+            let listed = crate::descriptor::host::list_views().then_some(self.recording);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3730,7 +3734,15 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        // Made once in this recording, then copied
+                        // ([`crate::descriptor::host::list_views`]).
+                        let copied = listed.is_some_and(|recording| {
+                            let words = crate::descriptor::record_at(table + u64::from(k) * 32);
+                            host.make_listed(recording, words, index, &view)
+                        });
+                        if !copied {
+                            host.make_at(index, &view);
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             tally(if crate::descriptor::host::is_texture_view(&view) { 14 } else { 15 }, 1);

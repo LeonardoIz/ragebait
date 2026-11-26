@@ -1036,7 +1036,6 @@ pub(crate) fn forget(resource: usize) {
 
 /// The record at `handle` (a descriptor slot in title memory): its tag and
 /// two words, read as they are.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn record_at(handle: u64) -> [u32; 3] {
     // SAFETY: the handle is a descriptor slot in title memory, at least 16
     // bytes.

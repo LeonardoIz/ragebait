@@ -2004,6 +2004,48 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// [`HostHeap::make_at`] for a view whose record words are `words`, in
+    /// the recording `recording` of a list ([`list_views`]): the first time
+    /// on this thread it is made in a heap the card does not see, then its
+    /// descriptor is copied into `index` each time. False if it could not
+    /// be (nothing done: the caller makes it as before).
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32, view: &View) -> bool {
+        use crate::framelog::{T, add};
+        if self.sampler {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.is_none() {
+                *views = ListViews::new(host);
+            }
+            let Some(views) = views.as_mut() else { return false };
+            let Some((at, new)) = views.slots.find(recording, words) else {
+                return false;
+            };
+            let from = views.slot(at);
+            if new {
+                // (A view the host cannot make is not kept: made as before.)
+                let Some(kept) = make(view, from) else {
+                    views.slots.forget(words);
+                    return false;
+                };
+                if views.kept.len() <= at as usize {
+                    views.kept.resize(at as usize + 1, None);
+                }
+                views.kept[at as usize] = kept;
+                add(T::ListViewsMade, 1);
+            } else {
+                add(T::ListViewsCopied, 1);
+            }
+            // SAFETY: a slot of our heap, and one of this thread's heap of the same type.
+            unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+            self.keep(index, views.kept[at as usize].clone());
+            true
+        })
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -3907,9 +3949,120 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Whether a list makes each view its fresh tables hold once per recording
+/// and copies its descriptor into every table after (`VICTORY_LIST_VIEWS=1`;
+/// off by default: made for every table, as before). After cgbj 4e77a87.
+///
+/// Thousands of indirect dispatches a frame each bind a table of their own
+/// that differs in one constant buffer, with the same views beside it; each
+/// table made every view anew. What a draw reads is still brought up to
+/// date for each table; only the making of the descriptor is shared.
+/// shortcut: a view made once stays as made for the rest of the recording
+/// (a texture whose host copy or shown levels change, or a buffer whose
+/// host copy is replaced, mid-list is seen from the list's next
+/// recording); drop the cache if that shows.
+/// The frame log's "list views" counts views made and copied.
+pub(crate) fn list_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// The slots of [`ListViews`]'s heap a recording of a list made views in,
+/// by their record words.
+#[derive(Default)]
+struct ListSlots {
+    recording: u64,
+    made: std::collections::HashMap<[u32; 3], u32>,
+}
+
+impl ListSlots {
+    const MOST: u32 = 8192;
+
+    /// The slot of `words` in `recording` (a new recording starts afresh),
+    /// and whether it is new; `None` when the slots are all taken.
+    fn find(&mut self, recording: u64, words: [u32; 3]) -> Option<(u32, bool)> {
+        if self.recording != recording {
+            self.recording = recording;
+            self.made.clear();
+        }
+        if let Some(&at) = self.made.get(&words) {
+            return Some((at, false));
+        }
+        let at = self.made.len() as u32;
+        if at >= Self::MOST {
+            return None;
+        }
+        self.made.insert(words, at);
+        Some((at, true))
+    }
+
+    /// Takes back the slot [`ListSlots::find`] just gave `words`.
+    fn forget(&mut self, words: [u32; 3]) {
+        self.made.remove(&words);
+    }
+}
+
+/// This thread's views made for one recording of a list
+/// ([`HostHeap::make_listed`]), in a heap the card does not see.
+struct ListViews {
+    slots: ListSlots,
+    /// What each slot's descriptor views, kept by the slots it is copied to.
+    kept: Vec<Kept>,
+    start: usize,
+    step: usize,
+    _heap: ID3D12DescriptorHeap,
+}
+
+impl ListViews {
+    fn new(host: &crate::host::Host) -> Option<ListViews> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: ListSlots::MOST,
+                    ..Default::default()
+                })
+                .ok()?;
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some(ListViews { slots: ListSlots::default(), kept: Vec::new(), start, step, _heap: heap })
+        }
+    }
+
+    fn slot(&self, at: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + at as usize * self.step }
+    }
+}
+
+thread_local! {
+    static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recording_makes_each_view_once() {
+        let mut slots = ListSlots::default();
+        let (a, b) = ([1, 2, 3], [1, 2, 4]);
+        assert_eq!(slots.find(1, a), Some((0, true)));
+        assert_eq!(slots.find(1, b), Some((1, true)));
+        assert_eq!(slots.find(1, a), Some((0, false)));
+        // A view that could not be made gives its slot back.
+        assert_eq!(slots.find(1, [9; 3]), Some((2, true)));
+        slots.forget([9; 3]);
+        assert_eq!(slots.find(1, [8; 3]), Some((2, true)));
+        // Another recording starts afresh.
+        assert_eq!(slots.find(2, b), Some((0, true)));
+        for i in 1..ListSlots::MOST {
+            assert_eq!(slots.find(2, [0, i, 0]), Some((i, true)));
+        }
+        assert_eq!(slots.find(2, [7; 3]), None);
+        assert_eq!(slots.find(2, b), Some((0, false)));
+    }
 
     #[test]
     fn constant_view_size_caps_before_rounding() {
