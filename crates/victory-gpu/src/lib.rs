@@ -95,3 +95,29 @@ pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// This crate's unit tests run one at a time, as fork commit 89e4127 runs
+/// them in CI: on Microsoft's software adapter (no card, or a card the tests
+/// do not use) its shader compiler has crashed the test program (access
+/// violation in d3d10warp) when several tests used it at once. Set before
+/// `main` so libtest reads it; `--test-threads` or an explicit
+/// `RUST_TEST_THREADS` still win.
+#[cfg(all(test, windows))]
+mod one_test_at_a_time {
+    extern "C" fn set() {
+        if std::env::var_os("RUST_TEST_THREADS").is_none() {
+            // SAFETY: before `main`, no other thread reads the environment.
+            unsafe { std::env::set_var("RUST_TEST_THREADS", "1") };
+        }
+    }
+
+    // The C runtime calls the initializers in `.CRT$XCU` before `main`.
+    #[used]
+    #[unsafe(link_section = ".CRT$XCU")]
+    static SET: extern "C" fn() = set;
+
+    #[test]
+    fn tests_run_one_at_a_time() {
+        assert!(std::env::var_os("RUST_TEST_THREADS").is_some());
+    }
+}
