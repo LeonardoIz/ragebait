@@ -68,6 +68,13 @@ shaders and emulates the one instruction.
   the excess X lanes outside EXEC. Partial Y or Z groups and partial X
   groups without a translated mask are dropped. This switch does not enable
   the builder. Framelog counts host calls under "thread-count dispatches".
+  A thread-count dispatch that still needs more than 65,535 groups in a
+  dimension (a spilled builder stage has no spread prologue) is dropped too.
+- With `VICTORY_BVH_RESIDENT_BOXES=1` (after kelvaroq native/patches/0056)
+  the box test over title memory takes a child only if the pages holding its
+  pointer and bounds have a host copy. A missing page reads as zeros, and a
+  ray through the origin otherwise hits that zero-sized box and takes its
+  zero pointers as children. Off, the translation is unchanged.
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
