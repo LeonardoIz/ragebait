@@ -1,0 +1,11 @@
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+    uv = float2((id << 1) & 2, id & 2);
+    pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    return tex.Sample(smp, uv);
+}
