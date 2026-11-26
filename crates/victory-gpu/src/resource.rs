@@ -945,6 +945,23 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// A page-mapping copy's mappings in order, `(to, from, len, repeat)` as
+/// for [`PageMapper`], where `repeat` maps the one page at `from` at every
+/// page of `to` (stopping at the first page if `from` shows nothing); false
+/// if any failed. The runtime joins neighbouring ones (`VICTORY_REMAP_BATCH`).
+pub type PageBatchMapper = fn(&[(u64, u64, u64, bool)]) -> bool;
+static PAGE_BATCH_MAPPER: std::sync::OnceLock<PageBatchMapper> = std::sync::OnceLock::new();
+
+/// Named by the runtime only when it joins mappings: the queues then hand
+/// it a whole page-mapping copy instead of [`page_mapper`] call by call.
+pub fn use_page_batch_mapper(mapper: PageBatchMapper) {
+    let _ = PAGE_BATCH_MAPPER.set(mapper);
+}
+
+pub(crate) fn page_batch_mapper() -> Option<PageBatchMapper> {
+    PAGE_BATCH_MAPPER.get().copied()
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only

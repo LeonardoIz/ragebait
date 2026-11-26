@@ -27,6 +27,12 @@ pub fn timing() -> [u64; 4] {
     .map(total)
 }
 
+/// The system's unmapping and mapping calls so far ([`T::RemapUnmaps`],
+/// [`T::RemapViews`]), read around each call like [`timing`].
+pub fn os_calls() -> [u64; 2] {
+    [T::RemapUnmaps, T::RemapViews].map(total)
+}
+
 struct Page {
     frame: u64,
     touches: u64,
@@ -51,11 +57,12 @@ struct Counts {
     after_clear: [u64; 4],
     sizes: [u64; 5],
     us: [u64; 5],
+    os: [u64; 2],
     backings: HashSet<Backing>,
 }
 
 impl Counts {
-    fn call(&mut self, n: usize, ok: bool, adjacent: bool, us: [u64; 5]) {
+    fn call(&mut self, n: usize, ok: bool, adjacent: bool, us: [u64; 5], os: [u64; 2]) {
         self.calls += 1;
         self.failed += u64::from(!ok);
         self.adjacent += u64::from(adjacent);
@@ -68,6 +75,9 @@ impl Counts {
         }] += 1;
         for (sum, elapsed) in self.us.iter_mut().zip(us) {
             *sum += elapsed;
+        }
+        for (sum, calls) in self.os.iter_mut().zip(os) {
+            *sum += calls;
         }
     }
 
@@ -136,7 +146,10 @@ impl Counts {
     }
 
     fn time(&self) -> String {
-        format!("us[unmap,map,commit,reader_wait,bookkeeping]={:?}", self.us)
+        format!(
+            "us[unmap,map,commit,reader_wait,bookkeeping]={:?} os_calls[unmap,map]={:?}",
+            self.us, self.os
+        )
     }
 }
 
@@ -196,6 +209,7 @@ pub fn record(
     n: usize,
     ok: bool,
     us: [u64; 5],
+    os: [u64; 2],
     pages: impl Iterator<Item = (usize, Option<Backing>, Option<Backing>, bool)>,
 ) {
     static REGISTER: Once = Once::new();
@@ -209,8 +223,8 @@ pub fn record(
     let stats = guard.get_or_insert_with(Stats::default);
     let adjacent = ok && n != 0 && stats.previous_end == Some(base);
     stats.previous_end = (ok && n != 0).then_some(end);
-    stats.current.call(n, ok, adjacent, us);
-    stats.total.call(n, ok, adjacent, us);
+    stats.current.call(n, ok, adjacent, us, os);
+    stats.total.call(n, ok, adjacent, us, os);
     for (at, before, after, aliased) in pages {
         stats.touch(at, before, after, aliased);
     }
