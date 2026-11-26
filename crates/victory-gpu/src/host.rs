@@ -213,7 +213,12 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if retire_lean() && !reaper_on() {
+            // Dropped here, as `reap` would, without a list made for it.
+            drop(object);
+            return;
+        }
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -223,8 +228,92 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// Whether descriptor slots written again with the object they already
+/// held let the old reference go at once instead of retiring it, and
+/// [`bury`] sorts what it drops outside the lock (`VICTORY_RETIRE_LEAN=1`;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). Off by default.
+///
+/// Why: run 313 retired 36.8 million host objects in about 240 s (some
+/// 150,000 a second, about ten a draw at the boat save): every write of a
+/// descriptor slot of ours retires the reference it held
+/// (`HostHeap::keep`), each a boxed object pushed under one lock that the
+/// recording threads, the submitting thread (`sync_heaps`) and the thread
+/// that lands flights share, and [`bury`] held that lock while it sorted
+/// the whole list at every landing. A slot written again with the same
+/// object keeps that object alive through the new reference: its old one
+/// can go at once (a reference count that cannot reach zero).
+pub(crate) fn retire_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_RETIRE_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "descriptor slots written again with the same object let the old reference go at once from now (VICTORY_RETIRE_LEAN=alt): {}",
+                    if on { "ON" } else { "off, retired as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Descriptor slots written since the start (`HostHeap::keep`): with an
+/// object where they held one, and of those the ones that held the same
+/// object; and the old references let go at once for that
+/// ([`retire_lean`]). Said every 2^20 writes of the first kind.
+pub(crate) static SLOT_REWRITES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a slot write that replaced `old` by `new` and says whether the
+/// old reference may go at once (the same object, [`retire_lean`] on).
+pub(crate) fn slot_rewritten(old: &ID3D12Resource, new: Option<&ID3D12Resource>) -> bool {
+    let same = new.is_some_and(|new| new.as_raw() == old.as_raw());
+    let before = SLOT_REWRITES[0].fetch_add(1, Ordering::Relaxed);
+    if same {
+        SLOT_REWRITES[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let lean = same && retire_lean();
+    if lean {
+        SLOT_REWRITES[2].fetch_add(1, Ordering::Relaxed);
+    }
+    if (before + 1).is_multiple_of(1 << 20) {
+        tracing::info!(
+            "descriptor slots written over an object they held: {} so far, {} of them with the same object; {} old references let go at once (VICTORY_RETIRE_LEAN), the rest retired",
+            before + 1,
+            SLOT_REWRITES[1].load(Ordering::Relaxed),
+            SLOT_REWRITES[2].load(Ordering::Relaxed)
+        );
+    }
+    lean
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    if retire_lean() {
+        // Taken out whole, sorted with no lock held, what still waits put
+        // back (beside what was retired meanwhile; the order means nothing).
+        let all = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+        if all.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<(u64, Retired)>, Vec<(u64, Retired)>) =
+            all.into_iter().partition(|(at, _)| *at <= finished);
+        if !keep.is_empty() {
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
+        }
+        reap(done.into_iter().map(|(_, object)| object).collect());
+        return;
+    }
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -236,7 +325,108 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, object)| object).collect());
+}
+
+/// Whether host objects that are let go are dropped by a thread of their
+/// own (`VICTORY_REAPER=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log). Off by default.
+///
+/// Why: dropping a host texture or buffer is a call into Direct3D and the
+/// driver (the allocation destroyed, its card address freed), and it ran on
+/// whichever thread let the object go. Profile 307 (the boat save, 169 ms
+/// a frame): the submitting thread is 7.8 ms of every frame inside
+/// `resource::let_go_idle`, all of it those calls: the once-a-second sweep
+/// drops what it lets go at once when nothing is in the air, about 46 ms in
+/// one submission's preparing, with the title's present standing behind
+/// it. The thread that lands flights does the same for what [`bury`] hands
+/// it.
+///
+/// With the switch the object goes to a list and a thread of ours drops
+/// it. Nothing else changes: an object is handed over at the moment it was
+/// dropped before (never earlier: [`retire`] still keeps it while a
+/// submission that may use it is running), and it was already dropped on
+/// "whatever thread finishes the submission" ([`Retired`]). The card's
+/// memory comes back some milliseconds later than before.
+fn reaper_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_REAPER").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if asked == 0 || std::thread::Builder::new().name("victory-reaper".into()).spawn(reaper).is_err() {
+            return 0;
+        }
+        tracing::info!("host objects that are let go are dropped by a thread of their own (VICTORY_REAPER=1; alt: in turn)");
+        asked
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "host objects let go are dropped by their own thread from now (VICTORY_REAPER=alt): {}",
+                    if on { "ON" } else { "off, by the thread that lets them go as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// What waits for [`reaper`].
+static REAP: (Mutex<Vec<Retired>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Objects [`reaper`] dropped since the start, and the microseconds that took.
+static REAPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops `objects`: here, or with [`reaper_on`] on the thread of that name.
+fn reap(objects: Vec<Retired>) {
+    if objects.is_empty() {
+        return;
+    }
+    if !reaper_on() {
+        drop(objects);
+        return;
+    }
+    REAP.0.lock().unwrap_or_else(|e| e.into_inner()).extend(objects);
+    REAP.1.notify_one();
+}
+
+/// The thread of [`reaper_on`]: drops what [`reap`] hands it, with no lock
+/// of ours held, and says every 4,096 objects how long the drops took.
+fn reaper() {
+    loop {
+        let objects = {
+            let mut waiting = REAP.0.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.is_empty() {
+                waiting = REAP.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            std::mem::take(&mut *waiting)
+        };
+        let began = std::time::Instant::now();
+        let count = objects.len() as u64;
+        drop(objects);
+        let us = began.elapsed().as_micros() as u64;
+        let before = REAPED[0].fetch_add(count, Ordering::Relaxed);
+        let spent = REAPED[1].fetch_add(us, Ordering::Relaxed) + us;
+        if (before + count) / 4096 != before / 4096 {
+            tracing::info!(
+                "host objects dropped by their own thread (VICTORY_REAPER): {} so far in {:.1} ms of that thread ({:.0} us each); the last batch {count} in {:.1} ms",
+                before + count,
+                spent as f64 / 1e3,
+                spent as f64 / (before + count) as f64,
+                us as f64 / 1e3
+            );
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
