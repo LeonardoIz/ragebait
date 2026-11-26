@@ -7690,18 +7690,23 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    if near_writes() {
-                        batch.title_wrote_near(dst, len, false);
+                    let known = if near_writes() {
+                        batch.title_wrote_near(dst, len, false).is_some()
                     } else {
                         batch.title_wrote(dst, len);
-                    }
+                        true
+                    };
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    if known {
+                        crate::watch::wrote(dst, len);
+                    } else {
+                        crate::watch::ask_once_end();
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -7732,8 +7737,12 @@ impl HostList {
                     // for a title buffer copy ([`near_writes`]).
                     let written = batch.title_wrote_near(*at, *len, true);
                     work();
-                    for &(from, to) in &written {
-                        crate::watch::wrote(from, to - from);
+                    if let Some(written) = written {
+                        for (from, to) in written {
+                            crate::watch::wrote(from, to - from);
+                        }
+                    } else {
+                        crate::watch::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -8054,9 +8063,10 @@ impl Batch {
     /// shows the same 64 KiB pages counts as written too
     /// (`crate::inplace::pages_of`); a view write of more than
     /// [`NEAR_VIEW_PAGES`] pages, or more than [`NEAR_PENDING`] refreshes
-    /// pending, is done as before ([`Batch::title_wrote`]). Returns the
-    /// written ranges (the place, and the other addresses of its pages).
-    fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Vec<(usize, usize)> {
+    /// pending, takes the full fallback ([`Batch::title_written`]). Returns
+    /// the written ranges (including aliases), or `None` if the write-watch
+    /// asking must end because the aliases weren't enumerated.
+    fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Option<Vec<(usize, usize)>> {
         // Textures due a check read title memory as it is before the write.
         self.check_textures();
         use std::sync::atomic::Ordering::Relaxed;
@@ -8081,9 +8091,9 @@ impl Batch {
         NEAR[usize::from(run)].fetch_add(1, Relaxed);
         if whole {
             NEAR[2].fetch_add(1, Relaxed);
-            self.title_wrote(at, len);
+            self.title_written();
             near_line();
-            return written;
+            return None;
         }
         let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
         // The refreshes that hold written bytes: done now, before the write.
@@ -8127,7 +8137,7 @@ impl Batch {
             });
         }
         near_line();
-        written
+        Some(written)
     }
 
     /// With [`parallel_refresh`]: checks the textures due ([`Batch::due_textures`])
@@ -10221,6 +10231,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn a_large_near_write_with_aliases_requires_a_new_snapshot() {
+        const PAGE: usize = 1 << 16;
+        const AT: usize = 0x7_5000_0000;
+        const ALIAS: usize = 0x7_5100_0000;
+        const LEN: usize = (super::NEAR_VIEW_PAGES + 1) * PAGE;
+        crate::inplace::title_memory_view(AT, LEN, 78, 0);
+        crate::inplace::title_memory_view(ALIAS, LEN, 78, 0);
+        let mut batch = Batch::default();
+        let small = batch.title_wrote_near(AT, PAGE, true);
+        let large = batch.title_wrote_near(AT, LEN, true);
+        crate::inplace::views_gone(AT, LEN);
+        crate::inplace::views_gone(ALIAS, LEN);
+        assert_eq!(small.unwrap(), [(AT, AT + PAGE), (ALIAS, ALIAS + PAGE)]);
+        assert!(large.is_none());
     }
 
     /// The hashing a submission does for textures in physical-page memory,
