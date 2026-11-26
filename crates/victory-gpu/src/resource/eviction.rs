@@ -123,7 +123,8 @@ pub(super) fn may_retry(retry_at: u64, now_ms: u64) -> bool {
 
 /// After a failed host creation with eviction `enabled`: the time of the
 /// next try for a transient out-of-memory error on a filled texture (and a
-/// trim is requested), or `None` for a permanent refusal.
+/// trim is requested by setting `ALLOCATION_FAILED`), or `None` for a
+/// permanent refusal.
 pub(super) fn retry_at(
     enabled: bool,
     out_of_memory: bool,
@@ -168,7 +169,8 @@ pub(crate) fn eviction_skipped(video: impl FnOnce() -> Option<[u64; 4]>) {
     static SAID: std::sync::Once = std::sync::Once::new();
     let now = crate::host::now_ms();
     let tenth = now / 100 + 1;
-    if COUNTED_TENTH.load(Relaxed) == tenth
+    // Claimed before the check, so the DXGI query runs at most once per 100 ms.
+    if COUNTED_TENTH.swap(tenth, Relaxed) == tenth
         || !stalled(LAST_RUN_MS.load(Relaxed), now, || {
             ALLOCATION_FAILED.load(Relaxed)
                 || pressure(video(), texture_bytes(), texture_budget()) != (0, 0)
@@ -176,7 +178,6 @@ pub(crate) fn eviction_skipped(video: impl FnOnce() -> Option<[u64; 4]>) {
     {
         return;
     }
-    COUNTED_TENTH.store(tenth, Relaxed);
     add(T::VramEvictStalled, 1);
     SAID.call_once(|| {
         tracing::warn!("VRAM eviction needed but not run for 5 s: no idle moment between submissions (late or relay flights?)");

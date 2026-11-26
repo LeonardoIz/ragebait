@@ -348,8 +348,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 
 /// Graphics (0x1c8) and compute (0x218) pipeline-state deserialization,
 /// as identified in the public console device ABI notes. The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+/// as `(this, description, interface id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
 /// pipeline, silently. What the descriptions hold is not known: the calls
 /// fail as they always did, with `out` null, and the first ones log the

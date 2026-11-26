@@ -2389,7 +2389,7 @@ mod mapping_tests {
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
     }
-}
+
     #[test]
     fn kept_asking_leaves_the_range_plan_unread() {
         let mut journal = Journal {
@@ -2406,3 +2406,4 @@ mod mapping_tests {
         assert_eq!(journal.asked, 7);
         assert_eq!(journal.ahead_asked, 7);
     }
+}
