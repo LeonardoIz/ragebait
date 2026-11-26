@@ -126,6 +126,9 @@ pub enum T {
     /// its time on whichever thread, and the changed heap pages it read.
     HeapSyncUs,
     HeapSyncPages,
+    /// Of those pages, the ones threads other than the pass's own read
+    /// (`VICTORY_SYNC_THREADS`).
+    HeapSyncPagesBeside,
     /// Descriptor copies whose source already held what the destination
     /// did, not written (`VICTORY_SAME_RECORDS=1`).
     SameRecords,
@@ -464,7 +467,7 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers; {:.0} no-ops skipped; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change          {:.1}; {:.0} views cut, {:.1} MB of them mapped again; {:.0} views mapped for {:.0} pages) | descriptors: heap pass {:.1} ms over {:.0} pages, {:.0} copies onto themselves left alone; list views {:.0} made, {:.0} copied; heap buffer passes {:.0} in {:.1} ms | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms |          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         readers; {:.0} no-ops skipped; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change          {:.1}; {:.0} views cut, {:.1} MB of them mapped again; {:.0} views mapped for {:.0} pages) | descriptors: heap pass {:.1} ms over {:.0} pages ({:.0} read beside), {:.0} copies onto themselves left alone; list views {:.0} made, {:.0} copied; heap buffer passes {:.0} in {:.1} ms | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms |          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -516,6 +519,7 @@ fn text(f: &Frame) -> String {
         t(T::RemapPages),
         ms(T::HeapSyncUs),
         t(T::HeapSyncPages),
+        t(T::HeapSyncPagesBeside),
         t(T::SameRecords),
         t(T::ListViewsMade),
         t(T::ListViewsCopied),

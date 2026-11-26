@@ -2354,51 +2354,79 @@ impl HostHeap {
     pub(crate) fn mirror_copied_page(
         &self,
         slots: std::ops::Range<u64>,
-        (start, step): (u64, u64),
+        at: (u64, u64),
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
+        let (looked, due) = self.copied_page_due(slots, at, from, page);
+        self.mirror_due(&due);
+        (looked, due.len() as u64)
+    }
+
+    /// The first half of [`HostHeap::mirror_copied_page`]: the records it
+    /// looked at, and the slots (with their title handles) to mirror, whose
+    /// fingerprints are noted as seen. The fingerprints are worked out
+    /// before the lock is taken, so that pages compared on several threads
+    /// (`super::sync_threads`) wait for one another only to compare.
+    pub(crate) fn copied_page_due(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, Vec<(u32, u64)>) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
+        // Slot, handle, fingerprint (never 0, which is "never looked at"),
+        // whether the record holds nothing.
+        let mut prints: Vec<(u32, u64, u64, bool)> = Vec::with_capacity(slots.clone().count());
+        for index in slots {
+            let handle = start + index * step;
+            // A record that straddles the range's ends is left to the
+            // range that holds its first byte.
+            let Some(at) = (handle as usize).checked_sub(from) else {
+                continue;
+            };
+            let Some(record) = page.get(at..at + step as usize) else {
+                continue;
+            };
+            looked += 1;
+            // None past the host heap's slots, as `mirror_copied`.
+            if index >= u64::from(self.count) {
+                continue;
             }
-            for index in slots {
-                let handle = start + index * step;
-                // A record that straddles the range's ends is left to the
-                // range that holds its first byte.
-                let Some(at) = (handle as usize).checked_sub(from) else {
-                    continue;
-                };
-                let Some(record) = page.get(at..at + step as usize) else {
-                    continue;
-                };
-                looked += 1;
-                // None past the host heap's slots, as `mirror_copied`.
-                let Some(last) = copied.get_mut(index as usize) else {
-                    continue;
-                };
-                // Never 0, which is "never looked at".
-                let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
-                    continue;
-                }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    continue;
-                }
-                *last = print;
-                due.push((index as u32, handle));
-            }
+            prints.push((index as u32, handle, record_print(record) | 1, record.iter().all(|&b| b == 0)));
         }
-        for &(index, handle) in &due {
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if copied.is_empty() {
+            copied.resize(self.count as usize, 0);
+        }
+        for (index, handle, print, empty) in prints {
+            let Some(last) = copied.get_mut(index as usize) else {
+                continue;
+            };
+            // The record last seen, or a slot never looked at that
+            // holds nothing: as it was.
+            if *last == print || (*last == 0 && empty) {
+                continue;
+            }
+            // A table's slot lately: left to its draws, and looked at
+            // again next time.
+            if !tables && self.tabled_lately(index, frame) {
+                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            *last = print;
+            due.push((index, handle));
+        }
+        (looked, due)
+    }
+
+    /// The second half of [`HostHeap::mirror_copied_page`]: the slots
+    /// [`HostHeap::copied_page_due`] found, mirrored in order.
+    pub(crate) fn mirror_due(&self, due: &[(u32, u64)]) {
+        for &(index, handle) in due {
             #[cfg(feature = "diagnostics")]
             MIRROR_HOW.with(|how| how.set(MIRROR_UNSET));
             #[cfg(feature = "diagnostics")]
@@ -2407,7 +2435,6 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             mirror_counted(one.elapsed().as_micros() as u64);
         }
-        (looked, due.len() as u64)
     }
 
     /// Makes host slot `index` from the record at `handle` if it is still
