@@ -153,12 +153,10 @@ pub(crate) enum C {
     /// skip of them would take off at most.
     RefreshKnown,
     RefreshKnownUs,
-    /// Refreshes skipped as known unchanged (`VICTORY_REGION_SKIP`).
-    RefreshSkipped,
 }
 /// One slot per counter: follows the enum (a fixed 80 was outrun by the
 /// refresh counters and ended run 324 with an index past the end).
-const COUNTERS: usize = C::RefreshSkipped as usize + 1;
+const COUNTERS: usize = C::RefreshKnownUs as usize + 1;
 const _: () = assert!(COUNTERS <= 256, "the counters' array stays small");
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
@@ -432,21 +430,6 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
-    }
-}
-
-#[cfg(test)]
-mod counter_tests {
-    /// Every counter has a slot: the last one too (run 324 ended with an
-    /// index past the end of a fixed-size array).
-    #[test]
-    fn the_last_counter_has_a_slot() {
-        use super::{C, COUNT, add};
-        use std::sync::atomic::Ordering::Relaxed;
-        let before = COUNT[C::RefreshSkipped as usize].load(Relaxed);
-        add(C::RefreshSkipped, 1);
-        add(C::RefreshKnownUs, 0);
-        assert!(COUNT[C::RefreshSkipped as usize].load(Relaxed) > before);
     }
 }
 
@@ -1308,15 +1291,13 @@ pub(crate) fn log(frames: f64) {
         "  refreshes of watched host copies per frame: {:.0} copied nothing ({:.2} ms), {:.0} copied something \
          ({:.2} ms); of those that copied nothing, {:.0} were known unchanged before asking ({:.2} ms; \
          VICTORY_REFRESH_COUNT=1 looks: every block of the range read-only by our hand and clean, or the range \
-         asked ahead, and no page noted written since the copy took it); skipped as known unchanged \
-         (VICTORY_REGION_SKIP): {:.0}",
+         asked ahead, and no page noted written since the copy took it)",
         c[C::RefreshNone as usize],
         c[C::RefreshNoneUs as usize] / 1e3,
         c[C::RefreshSome as usize],
         c[C::RefreshSomeUs as usize] / 1e3,
         c[C::RefreshKnown as usize],
         c[C::RefreshKnownUs as usize] / 1e3,
-        c[C::RefreshSkipped as usize],
     );
     crate::draw::window_line(frames);
     tracing::info!(

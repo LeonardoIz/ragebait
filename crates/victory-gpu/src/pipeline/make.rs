@@ -24,14 +24,14 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 /// `VICTORY_DENY_PIPELINES=<16-hex shader hash>,...` (off unless set): the
-/// hash of a shader of `shaders` that is listed there. Such a pipeline is
+/// shader hash from `hashes` that is listed there. Such a pipeline is
 /// never built (no driver compile) and counts as refused, so its draws and
 /// dispatches are dropped: a test of whether building a pipeline, rather
 /// than running it, is what loses the card (runs 281 and 318: the removal
 /// 32 and 81 ms after the 3-second build of `CS_RaytracingResolve` of the
 /// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
 /// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
-fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
+pub(super) fn denied<'a>(hashes: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     let list = LIST.get_or_init(|| {
         std::env::var("VICTORY_DENY_PIPELINES")
@@ -41,10 +41,14 @@ fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
             .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .collect()
     });
+    denied_by(list, hashes)
+}
+
+fn denied_by<'a>(list: &[String], hashes: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     if list.is_empty() {
         return None;
     }
-    shaders.iter().find(|s| list.contains(&s.hash)).map(|s| s.hash.as_str())
+    hashes.into_iter().find(|hash| list.iter().any(|denied| denied == hash))
 }
 
 /// The shaders of `p` (for logs).
@@ -88,7 +92,7 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
-            if let Some(hash) = denied(&self.shaders) {
+            if let Some(hash) = denied(self.shaders.iter().map(|s| s.hash.as_str())) {
                 tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
                 return None;
             }
@@ -393,6 +397,16 @@ fn drained() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn any_shader_can_deny_a_pipeline() {
+        let allowed = "0123012301230123";
+        let denied = "4567456745674567";
+        let list = [denied.to_owned()];
+        assert_eq!(super::denied_by(&[], [allowed, denied]), None);
+        assert_eq!(super::denied_by(&list, [allowed]), None);
+        assert_eq!(super::denied_by(&list, [allowed, denied]), Some(denied));
+    }
+
     use super::*;
 
     /// A first use queues the pipeline and, within the budget, gets the

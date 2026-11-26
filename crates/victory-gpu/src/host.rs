@@ -2930,12 +2930,22 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
+    /// Heap worker uploads, kept with the flight until its fence completes.
+    uploads: Vec<HostList>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
     /// Title-memory ranges written when its shader textures are copied back.
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+}
+
+fn keep_uploads(uploads: Vec<HostList>, lists: &mut Vec<crate::list::Detached>, order: &mut Vec<usize>) {
+    if !uploads.is_empty() {
+        let first = lists.len();
+        order.splice(0..0, first..first + uploads.len());
+        lists.extend(uploads.into_iter().map(crate::list::Detached::ours));
+    }
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2945,6 +2955,8 @@ struct Flight {
     number: u64,
     /// The value signalled on the host's fence behind it.
     fence: u64,
+    /// All lists sent, including a present list the caller keeps.
+    count: usize,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
@@ -5532,7 +5544,7 @@ impl Host {
             let mut ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
+                    *lists += flight.count;
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
@@ -5719,14 +5731,6 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
-        // Textures uploaded ahead (`crate::heap_worker`): their lists run
-        // before the title's.
-        let ahead = crate::heap_worker::take_ready();
-        if !ahead.is_empty() {
-            let first = lists.len();
-            order.splice(0..0, first..first + ahead.len());
-            lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
-        }
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -5737,6 +5741,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        keep_uploads(sent.uploads, &mut lists, &mut order);
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -5753,6 +5758,7 @@ impl Host {
             items.push(Late::Run(Flight {
                 number: sent.number,
                 fence: *target,
+                count: order.len(),
                 lists,
                 order,
                 card: sent.card,
@@ -5789,6 +5795,8 @@ impl Host {
             return 0;
         };
         let number = sent.number;
+        let (mut lists, mut order) = (Vec::new(), Vec::new());
+        keep_uploads(sent.uploads, &mut lists, &mut order);
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -5799,13 +5807,14 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
-            *flying += 1;
+            *flying += 1 + order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number,
                 fence: *target,
-                lists: Vec::new(),
-                order: Vec::new(),
+                count: 1 + order.len(),
+                lists,
+                order,
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -5978,6 +5987,16 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Publish ready texture descriptors under the same lock that sends
+        // their upload lists ahead of any draws that can read those slots.
+        let uploads = crate::heap_worker::take_ready();
+        let with_uploads;
+        let runs = if uploads.is_empty() {
+            runs
+        } else {
+            with_uploads = uploads.iter().chain(runs.iter().copied()).collect::<Vec<_>>();
+            &with_uploads
+        };
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6138,6 +6157,7 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
+                uploads,
                 card,
                 back,
                 texture_back_ranges,
@@ -6286,6 +6306,11 @@ impl Host {
         // their notes can go.
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        if !uploads.is_empty() {
+            let (mut lists, mut order) = (Vec::new(), Vec::new());
+            keep_uploads(uploads, &mut lists, &mut order);
+            crate::list::recycle(lists, &order);
         }
         working(was_working);
         None
@@ -7665,18 +7690,23 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    if near_writes() {
-                        batch.title_wrote_near(dst, len, false);
+                    let known = if near_writes() {
+                        batch.title_wrote_near(dst, len, false).is_some()
                     } else {
                         batch.title_wrote(dst, len);
-                    }
+                        true
+                    };
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    if known {
+                        crate::watch::wrote(dst, len);
+                    } else {
+                        crate::watch::ask_once_end();
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -7707,8 +7737,12 @@ impl HostList {
                     // for a title buffer copy ([`near_writes`]).
                     let written = batch.title_wrote_near(*at, *len, true);
                     work();
-                    for &(from, to) in &written {
-                        crate::watch::wrote(from, to - from);
+                    if let Some(written) = written {
+                        for (from, to) in written {
+                            crate::watch::wrote(from, to - from);
+                        }
+                    } else {
+                        crate::watch::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -8029,9 +8063,10 @@ impl Batch {
     /// shows the same 64 KiB pages counts as written too
     /// (`crate::inplace::pages_of`); a view write of more than
     /// [`NEAR_VIEW_PAGES`] pages, or more than [`NEAR_PENDING`] refreshes
-    /// pending, is done as before ([`Batch::title_wrote`]). Returns the
-    /// written ranges (the place, and the other addresses of its pages).
-    fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Vec<(usize, usize)> {
+    /// pending, takes the full fallback ([`Batch::title_written`]). Returns
+    /// the written ranges (including aliases), or `None` if the write-watch
+    /// asking must end because the aliases weren't enumerated.
+    fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Option<Vec<(usize, usize)>> {
         // Textures due a check read title memory as it is before the write.
         self.check_textures();
         use std::sync::atomic::Ordering::Relaxed;
@@ -8056,9 +8091,9 @@ impl Batch {
         NEAR[usize::from(run)].fetch_add(1, Relaxed);
         if whole {
             NEAR[2].fetch_add(1, Relaxed);
-            self.title_wrote(at, len);
+            self.title_written();
             near_line();
-            return written;
+            return None;
         }
         let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
         // The refreshes that hold written bytes: done now, before the write.
@@ -8102,7 +8137,7 @@ impl Batch {
             });
         }
         near_line();
-        written
+        Some(written)
     }
 
     /// With [`parallel_refresh`]: checks the textures due ([`Batch::due_textures`])
@@ -10196,6 +10231,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn a_large_near_write_with_aliases_requires_a_new_snapshot() {
+        const PAGE: usize = 1 << 16;
+        const AT: usize = 0x7_5000_0000;
+        const ALIAS: usize = 0x7_5100_0000;
+        const LEN: usize = (super::NEAR_VIEW_PAGES + 1) * PAGE;
+        crate::inplace::title_memory_view(AT, LEN, 78, 0);
+        crate::inplace::title_memory_view(ALIAS, LEN, 78, 0);
+        let mut batch = Batch::default();
+        let small = batch.title_wrote_near(AT, PAGE, true);
+        let large = batch.title_wrote_near(AT, LEN, true);
+        crate::inplace::views_gone(AT, LEN);
+        crate::inplace::views_gone(ALIAS, LEN);
+        assert_eq!(small.unwrap(), [(AT, AT + PAGE), (ALIAS, ALIAS + PAGE)]);
+        assert!(large.is_none());
     }
 
     /// The hashing a submission does for textures in physical-page memory,
