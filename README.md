@@ -81,6 +81,7 @@ prebuild after a driver or translator change.
 | `VICTORY_WAVE_WIDE_LIST` | Empty | Add comma-separated shader hashes to that selection |
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
+| `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
 | `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |
@@ -103,6 +104,36 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_GPU_TIMING=1` | each list timed on its own |
 | `VICTORY_SHOT=<folder>` | capture of one whole frame |
 | `VICTORY_FRAME_LOG=1` | length and breakdown of every frame |
+
+With `VICTORY_REMAP_STATS=1`, each present closes one measurement interval.
+`VICTORY_FRAME_LOG=1` logs a `frame N remap stats` line for that interval.
+The exit table combines all intervals, including `tail_calls` after the last
+present. It reports only aggregates.
+
+- `calls` includes alias and physical-page calls, with scatter counted as one
+  call per destination. `failed` counts calls that returned failure.
+  `call_pages` buckets calls by requested size in 64 KiB pages.
+- `touches` counts requested destination pages, including no-ops and failed
+  requests. `pages` counts distinct destinations, and `backings` counts
+  distinct physical pages seen before or after those requests. `unchanged`
+  counts touches whose final backing matches the initial one, including
+  empty-to-empty touches.
+- `same_frame` and `prev_1_8` classify repeat touches by when that destination
+  was last touched. `touches_per_page` buckets distinct destinations by their
+  touch count in the reported interval or in the whole run at exit.
+- `swap_return_frames` counts A→B→A returns, and `clear_return_frames` counts
+  A→empty→A returns. The gap starts when A was replaced. `mapped_elsewhere`
+  counts changed destinations whose incoming backing is also mapped at
+  another title destination after the call.
+- `adjacent_calls` counts consecutive successful nonempty calls in the
+  same frame whose destination ranges abut in increasing order. Adjacency
+  measures destination locality. The frame log's existing views-to-pages
+  counts show how much the actual mapping code coalesced.
+- The `us` buckets give cumulative microseconds. `map` includes the
+  placeholder split measured by the existing view mapper. `bookkeeping`
+  is elapsed remap time after subtracting the existing map, unmap, commit
+  and reader-wait timers. It includes untimed work such as run planning,
+  placeholder coalescing and failure handling, and excludes stats collection.
 
 Input: XInput pads. With none connected the keyboard is a pad (WASD/IJKL
 sticks, arrows D-pad, Enter/Backspace/X/Y buttons, Q/E/Z/C shoulders and

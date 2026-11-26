@@ -46,6 +46,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+pub mod remap_stats;
+#[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]
 mod host;
