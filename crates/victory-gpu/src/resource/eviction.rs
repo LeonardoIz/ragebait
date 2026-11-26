@@ -163,7 +163,7 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
     }
     let count = retired.len() as u64;
     // The host fence and list/descriptor checks ensure there are no GPU
-    // users. Release outside the locks, immediately instead of on the reaper,
+    // users. Release immediately (under the submit lock) instead of on the reaper,
     // so the room checks see the freed cache space on the next pass.
     drop(retired);
     add(T::VramEvictedBytes, evicted_bytes);

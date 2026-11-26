@@ -2836,7 +2836,8 @@ impl State {
             None => (span, per_frame),
         };
         // Reserve one batch per frame, even if another heap pass runs on the worker.
-        // At most 32 extra fingerprints (1.5 MiB sampled) and 4 MiB of source textures.
+        // At most 32 extra fingerprints (1.5 MiB sampled) of textures up to 128 KiB;
+        // past 48 KiB the fingerprint samples 3 x 16 KiB, so writes outside those go unseen.
         const WATCH_SLOTS: usize = 32;
         const WATCH_BYTES: u64 = 128 << 10;
         static WATCH_FRAME: AtomicU64 = AtomicU64::new(0);

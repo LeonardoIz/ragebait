@@ -1047,7 +1047,8 @@ fn reset_in(physical: &Physical, base: usize, len: usize) {
 /// [`reset_in`], as with `VICTORY_MAP_RUNS`. Nothing is deferred past the
 /// call: the title, and the next submission, see every mapping when it
 /// returns. Off by default, for A/B runs with `VICTORY_REMAP_STATS=1`
-/// (its `os_calls`).
+/// (its `os_calls`). It includes `VICTORY_MAP_RUNS`' handling of pages
+/// already right: A/B it against `VICTORY_MAP_RUNS=1`, not against nothing.
 pub(crate) fn remap_batch() -> bool {
     static BATCH: LazyLock<bool> =
         LazyLock::new(|| std::env::var("VICTORY_REMAP_BATCH").is_ok_and(|v| v.trim() == "1"));
@@ -1165,7 +1166,10 @@ fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) 
 /// [`map_alias`] for a whole page-mapping copy, in order
 /// ([`victory_gpu::resource::PageBatchMapper`]), neighbouring pages joined
 /// ([`remap_batch`]). It leaves what the mappings would leave one after
-/// another, failures included.
+/// another.
+/// shortcut: when the OS refuses a map inside a joined run, the rest of the
+/// run is left unmapped (sequentially, later ops would have mapped or kept
+/// it); upgrade if map failures stop being fatal.
 pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
     let mut guard = physical();
     let physical = &mut *guard;
@@ -2091,7 +2095,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
-    /// `n` pages of one new allocation.
     /// `VICTORY_REMAP_BATCH`: which mappings join a pending run, and the
     /// steps a joined run takes.
     #[test]
@@ -2252,6 +2255,7 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// `n` pages of one new allocation.
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
         assert_eq!(
