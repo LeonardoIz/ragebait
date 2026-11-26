@@ -249,9 +249,12 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let micros = started.elapsed().as_micros() as u64;
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros]) {
         count.fetch_add(n, Relaxed);
     }
+    crate::framelog::add(crate::framelog::T::HeapSyncUs, micros);
+    crate::framelog::add(crate::framelog::T::HeapSyncPages, pages);
 }
 
 /// Whether a submission's pass over the title's view heaps ([`sync_heaps`])
@@ -1172,12 +1175,32 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        let same = same_records() && unsafe {
+            std::slice::from_raw_parts(src as *const u8, len as usize) == std::slice::from_raw_parts(dst as *const u8, len as usize)
+        };
+        if same {
+            #[cfg(windows)]
+            crate::framelog::add(crate::framelog::T::SameRecords, 1);
+        } else {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
     }
+}
+
+/// Whether a descriptor copy whose destination already holds the source's
+/// bytes is left unwritten (`VICTORY_SAME_RECORDS=1`; off by default:
+/// written, as before). After cgbj e8d3d91. The write changes nothing but
+/// dirties the heap's write-watched page, and [`sync_heaps`] then reads and
+/// compares every record on it. The slots are mirrored either way.
+/// `crate::framelog::T::SameRecords` counts the copies left alone.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
