@@ -3231,8 +3231,17 @@ impl State {
             victory_shader::emit::spread_groups(group_x, group_y, group_z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
-        } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+        } else if !groups_fit([gx, gy, gz]) {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+            // A thread-count dispatch the host cannot take (a spilled
+            // builder stage has no spread prologue) is a dropped stage.
+            if counted {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a thread-count dispatch has more groups than the host takes");
+                }
+                return;
+            }
         }
         self.dispatch_spread = [row, asked];
         let mut ambient_views = None;
@@ -4598,6 +4607,22 @@ fn thread_groups(threads: [u32; 3], size: [u32; 3], mask_x: bool) -> Option<([u3
         return None;
     }
     Some((std::array::from_fn(|i| threads[i].div_ceil(size[i])), partial))
+}
+
+/// Whether D3D12 takes a dispatch of `groups` (at most 65,535 per dimension).
+fn groups_fit(groups: [u32; 3]) -> bool {
+    groups.iter().all(|&g| g <= 65_535)
+}
+
+#[cfg(test)]
+#[test]
+fn a_counted_dispatch_past_the_group_limit_does_not_fit() {
+    let (groups, _) = thread_groups([4_194_241, 1, 1], [64, 1, 1], true).unwrap();
+    assert_eq!(groups, [65_536, 1, 1]);
+    let (_, _, gx, gy, gz) = victory_shader::emit::spread_groups(groups[0], groups[1], groups[2], false);
+    assert!(!groups_fit([gx, gy, gz]));
+    let (_, _, gx, gy, gz) = victory_shader::emit::spread_groups(groups[0], groups[1], groups[2], true);
+    assert!(groups_fit([gx, gy, gz]));
 }
 
 #[cfg(test)]
