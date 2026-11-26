@@ -13,6 +13,50 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// A set of a heap's slots, a bit for each, taken without a lock. After cgbj
+/// c3e643e: a set of 70,000 slots gone through under its lock kept every
+/// writer of slots waiting. Slots past its last word are not held (none
+/// reach there: slots past the heap's count are never noted).
+struct Slots(Vec<std::sync::atomic::AtomicU64>);
+
+impl Slots {
+    fn new(count: u32) -> Self {
+        Slots((0..count.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    }
+
+    fn put(&self, slot: u32) {
+        if let Some(bits) = self.0.get(slot as usize / 64) {
+            bits.fetch_or(1 << (slot % 64), std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Whether it was there.
+    fn remove(&self, slot: u32) -> bool {
+        let bit = 1 << (slot % 64);
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.fetch_and(!bit, std::sync::atomic::Ordering::AcqRel) & bit != 0)
+    }
+
+    /// All of them, in order; with `take`, none is left.
+    fn all(&self, take: bool) -> Vec<u32> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut out = Vec::new();
+        for (n, bits) in self.0.iter().enumerate() {
+            let mut bits = match (bits.load(Acquire), take) {
+                (0, _) => continue,
+                (_, true) => bits.swap(0, AcqRel),
+                (b, false) => b,
+            };
+            while bits != 0 {
+                out.push(n as u32 * 64 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+}
+
 /// The locks [`HostHeap::kept`] is spread over: slot `i` is behind lock
 /// `i % KEPT_PIECES`, at place `i / KEPT_PIECES`. Neighbouring slots are
 /// behind different locks on purpose: the recording threads take their
@@ -123,10 +167,10 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: Slots,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Slots,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1165,8 +1209,8 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
-            changed: Mutex::default(),
+            buffers: Slots::new(count),
+            changed: Slots::new(count),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1877,15 +1921,13 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        self.buffers.all(false)
     }
 
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        self.changed.all(true)
     }
 
     /// Records what title slot `index` now holds for shaders that pick
@@ -1967,18 +2009,14 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
-            buffers.insert(index);
+            self.buffers.put(index);
             true
         } else {
-            buffers.remove(&index)
+            self.buffers.remove(index)
         };
         if was {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+            self.changed.put(index);
         }
         stale
     }
@@ -4050,6 +4088,20 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_sets_hold_their_slots_in_order() {
+        let set = Slots::new(200);
+        for slot in [130, 3, 64, 199, 3, 500] {
+            set.put(slot);
+        }
+        assert_eq!(set.all(false), [3, 64, 130, 199]);
+        assert!(set.remove(64));
+        assert!(!set.remove(64));
+        assert!(!set.remove(500));
+        assert_eq!(set.all(true), [3, 130, 199]);
+        assert!(set.all(false).is_empty());
+    }
 
     #[test]
     fn a_recording_makes_each_view_once() {
