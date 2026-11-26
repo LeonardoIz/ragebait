@@ -304,17 +304,30 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    {
-        let mut v = views();
-        v.views.insert(at, (len, section, offset));
-        for k in 0..len.div_ceil(K64) {
-            v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
-        }
-    }
+    note_view(at, len, section, offset);
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+}
+
+fn note_view(at: usize, len: usize, section: usize, offset: u64) {
+    let mut v = views();
+    v.views.insert(at, (len, section, offset));
+    for k in 0..len.div_ceil(K64) {
+        v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
+    }
+}
+
+/// The runtime made `[at, at + len)` read-write again inside the view
+/// `[view, view + bytes)` of `section` from `offset`, which stays mapped as
+/// it was: [`crate::title_memory_remapped`] and [`title_memory_view`] for
+/// that range only; the view stays known whole, and what lies outside the
+/// range (texture copy-backs, guards) is left alone.
+pub fn title_memory_refreshed(view: usize, bytes: usize, section: usize, offset: u64, at: usize, len: usize) {
+    crate::title_memory_remapped(at, len);
+    note_view(view, bytes, section, offset);
+    crate::watch::views_mapped(section, offset + (at - view) as u64, len);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

@@ -934,7 +934,7 @@ fn alias_in_runs(physical: &mut Physical, to: usize, from: usize, len: usize) ->
         let (at, bytes) = (to + first * PAGE, (end - first) * PAGE);
         if same {
             victory_gpu::framelog::add(victory_gpu::framelog::T::RemapSkips, 1);
-            reset(physical, views_in(physical, at, bytes));
+            reset_in(physical, at, bytes);
             continue;
         }
         unmap(physical, at, bytes);
@@ -947,6 +947,22 @@ fn alias_in_runs(physical: &mut Physical, to: usize, from: usize, len: usize) ->
         return false;
     }
     true
+}
+
+/// [`reset`] of `[base, base + len)` only: the views there stay mapped
+/// whole, and what they show outside the range is left as it is (a texture
+/// copy-back queued there stays good).
+fn reset_in(physical: &Physical, base: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    for at in views_in(physical, base, len) {
+        let (size, slice) = &physical.views[&at];
+        let (from, to) = (at.max(base), (at + size).min(base + len));
+        let mut old = 0;
+        // SAFETY: committed pages of a view of ours.
+        unsafe { VirtualProtect(from as *const c_void, to - from, PAGE_READWRITE, &mut old) };
+        let offset = (slice.index * PAGE) as u64;
+        victory_gpu::title_memory_refreshed(at, *size, slice.section.0 as usize, offset, from, to - from);
+    }
 }
 
 /// Maps `pages` slices from `slice` on at `base`, where only placeholders
@@ -1717,6 +1733,29 @@ mod tests {
         assert_eq!(query((b + PAGE) as *const c_void).host.State, MEM_RESERVE);
         same(2, 2, 57);
         assert!(runs(b, 0, 3));
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, std::ptr::null()), a as *mut c_void);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_MAP_RUNS`: a page left alone inside a larger view is made
+    /// read-write again by itself; the view and its other pages stay as
+    /// they are.
+    #[test]
+    fn a_page_left_alone_resets_only_itself() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let protect = |at: usize| query(at as *const c_void).host.Protect;
+        let pages = allocate(3);
+        let (a, b) = (reserve(3), reserve(3));
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, pages.as_ptr()), a as *mut c_void);
+        assert!(alias_in_runs(&mut physical(), b, a, 3 * PAGE));
+        let mut old = 0;
+        // SAFETY: a view of ours.
+        assert_ne!(unsafe { VirtualProtect(b as *const c_void, 3 * PAGE, PAGE_READONLY, &mut old) }, 0);
+        assert!(alias_in_runs(&mut physical(), b, a, PAGE));
+        assert_eq!(physical().views.get(&b).map(|v| v.0), Some(3 * PAGE), "the view stays");
+        assert_eq!(protect(b), PAGE_READWRITE);
+        assert_eq!((protect(b + PAGE), protect(b + 2 * PAGE)), (PAGE_READONLY, PAGE_READONLY));
+        assert!(alias_in_runs(&mut physical(), b, 0, 3 * PAGE));
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, std::ptr::null()), a as *mut c_void);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
