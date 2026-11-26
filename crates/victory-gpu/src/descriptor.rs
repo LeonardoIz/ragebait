@@ -1354,8 +1354,9 @@ pub(crate) mod tests {
     }
 
     #[cfg(windows)]
-    pub(crate) fn test_heap() -> This {
-        let desc = HeapDesc { kind: VIEWS_KIND, count: 1, flags: 0, nodes: 0 };
+    pub(crate) fn test_view_heap(count: u32, visible: bool) -> This {
+        let flags = if visible { SHADER_VISIBLE } else { 0 };
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags, nodes: 0 };
         let mut heap = std::ptr::null();
         assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut heap), S_OK);
         heap

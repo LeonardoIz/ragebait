@@ -3655,17 +3655,19 @@ impl State {
                     .contains(&(table, n))
                     .then(|| heap.index(table).filter(|at| at + n <= host.count()))
                     .flatten();
+                let table_texture = |k, handle, view: &View| {
+                    if let Some(title) = staged_title
+                        && crate::descriptor::host::is_texture_view(view)
+                    {
+                        host.texture_slot_tabled(title + k, true);
+                        host.mirror(title + k, handle, true);
+                    }
+                };
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
-                        if let Some(title) = staged_title
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            let k = u.table_offset_dwords / 8;
-                            host.texture_slot_tabled(title + k, true);
-                            host.mirror(title + k, handle, true);
-                        }
+                        table_texture(u.table_offset_dwords / 8, handle, &view);
                         #[cfg(feature = "diagnostics")]
                         tally(18, 1);
                     }
@@ -3679,6 +3681,7 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                        table_texture(k, handle, &view);
                         #[cfg(feature = "diagnostics")]
                         tally(18, 1);
                     }
@@ -4803,6 +4806,54 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stage_reusing_a_table_mirrors_the_texture_selected_by_a_root_constant() {
+        use crate::descriptor::{self, Heap};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let heap = descriptor::tests::test_view_heap(2, true);
+        let title = descriptor::heap(heap);
+        let views = title.host().unwrap();
+        let table = title.start;
+        let null = std::ptr::null();
+        descriptor::create_srv(null, null, std::ptr::null(), table + 32);
+        views.texture_slot_gone(1);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(false, 0, table);
+        state.set_constants(false, 1, &[1], 0);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let selected = [RootIndexedView {
+            table_slot: 0,
+            constant_slot: 1,
+            constant_dword: 0,
+            byte_offset: 0,
+            shift: 5,
+        }];
+        let spans = [(0, 2, 2)];
+        let mut staged = Vec::new();
+        let first = state.tables(&list, &used, &[], false, &spans, &mut staged);
+        assert_ne!(first[0].1, u32::MAX);
+        assert!(!views.made(1));
+        assert_eq!(state.tables(&list, &used, &selected, false, &spans, &mut staged), first);
+        assert_eq!(staged, [(table, 2)]);
+        assert!(views.made(1));
+        drop(state);
+        crate::object::release_boxed::<Heap>(heap);
+    }
 
     #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {

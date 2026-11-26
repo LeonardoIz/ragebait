@@ -296,7 +296,7 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
-        let heap = crate::descriptor::tests::test_heap();
+        let heap = crate::descriptor::tests::test_view_heap(1, false);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let marker = Arc::new(());
         let mut batch = Batch::new(crate::descriptor::heap(heap));
