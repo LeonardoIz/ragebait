@@ -666,6 +666,102 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
 }
 
+/// `VICTORY_REMAP_FAST=1`: a mapping call that would leave a range showing
+/// the pages it shows (or empty) skips the unmapping and mapping again and
+/// only resets what those would ([`refresh`]); the frame log counts them.
+/// Off by default, for A/B runs.
+fn remap_fast() -> bool {
+    static FAST: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_REMAP_FAST").is_ok_and(|v| v.trim() == "1"));
+    *FAST
+}
+
+/// The slice the page at `at` shows, if a view holds it.
+fn slice_at(views: &BTreeMap<usize, (usize, Slice)>, at: usize) -> Option<Slice> {
+    views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (at - base) / PAGE,
+            section: s.section.clone(),
+        })
+}
+
+/// Whether the pages from `base` on already show `wanted`, page for page
+/// ([`Slice::key`], `None` for unmapped).
+fn shows(views: &BTreeMap<usize, (usize, Slice)>, base: usize, wanted: &[Option<(usize, usize)>]) -> bool {
+    wanted
+        .iter()
+        .enumerate()
+        .all(|(k, w)| slice_at(views, base + k * PAGE).map(|s| s.key(0)) == *w)
+}
+
+/// [`XMemMapPhysicalPages`] with `VICTORY_REMAP_FAST`: if `[base, ..)`
+/// already shows `pages` (or is empty, null `pages`), [`refresh`] it and
+/// say so.
+fn same_pages(physical: &Physical, base: usize, n: usize, pages: *const usize) -> bool {
+    let wanted: Option<Vec<_>> = if pages.is_null() {
+        Some(vec![None; n])
+    } else {
+        // SAFETY: the title passes `n` page numbers.
+        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+        pages.iter().map(|p| physical.pages.get(p).map(|s| Some(s.key(0)))).collect()
+    };
+    let same = wanted.is_some_and(|w| shows(&physical.views, base, &w));
+    if same {
+        refresh(physical, base, n * PAGE);
+    }
+    same
+}
+
+/// [`map_alias`] with `VICTORY_REMAP_FAST`: if `to` already shows what it
+/// would (or is empty, `from` 0), [`refresh`] it and say so. A source
+/// overlapping `to` is lost to the unmapping: never the same.
+fn same_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    if from != 0 && from < to + len && to < from + len {
+        return false;
+    }
+    let wanted: Option<Vec<_>> = (0..len)
+        .step_by(PAGE)
+        .map(|k| match from {
+            0 => Some(None),
+            _ => slice_at(&physical.views, from + k).map(|s| Some(s.key(0))),
+        })
+        .collect();
+    let same = wanted.is_some_and(|w| shows(&physical.views, to, &w));
+    if same {
+        refresh(physical, to, len);
+    }
+    same
+}
+
+/// A remapping of `[base, base + len)` to what it shows already: no
+/// unmapping and no mapping again, but what the title or the GPU side would
+/// see those reset is reset, over every view they would take away and map
+/// again whole: read-write again, and the GPU side told it is remapped
+/// (guards, texture copy-backs, descriptors) and what it shows. Nothing
+/// mapped there: nothing to reset, no lock.
+fn refresh(physical: &Physical, base: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    victory_gpu::framelog::add(victory_gpu::framelog::T::RemapSkips, 1);
+    let hit = views_in(physical, base, len);
+    if hit.is_empty() {
+        return;
+    }
+    // As for a remapping: the GPU side's guards change with no read in
+    // place under way.
+    let _changing = victory_gpu::title_memory_remapping();
+    for at in hit {
+        let (size, slice) = &physical.views[&at];
+        let mut old = 0;
+        // SAFETY: a committed view of ours.
+        unsafe { VirtualProtect(at as *const c_void, *size, PAGE_READWRITE, &mut old) };
+        victory_gpu::title_memory_remapped(at, *size);
+        victory_gpu::title_memory_view(at, *size, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -675,6 +771,9 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    if remap_fast() && same_pages(&physical, base, n, pages) {
+        return address;
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -747,6 +846,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    if remap_fast() && same_alias(&physical, to, from, len) {
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
@@ -754,17 +856,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         if from == 0 {
             break;
         }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+        let Some(slice) = slice_at(&physical.views, from + k) else {
             return false;
         };
         if !map(&mut physical, to + k, PAGE, slice) {
@@ -871,6 +963,25 @@ fn commit_limit_message(
     message
 }
 
+/// The views that overlap `[base, base + len)`, by address.
+fn views_in(physical: &Physical, base: usize, len: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    // Views do not overlap: the one holding `base`, then those starting
+    // inside (the GPU's page mappings make one view per page).
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .map(|(at, _)| *at);
+    first
+        .into_iter()
+        .chain(physical.views.range(base + 1..base + len).map(|(at, _)| *at))
+        .collect()
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -881,19 +992,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
-    // Views do not overlap: the one holding `base`, then those starting
-    // inside (the GPU's page mappings make one view per page).
-    let first = physical
-        .views
-        .range(..=base)
-        .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
-        .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
-    for at in hit {
+    for at in views_in(physical, base, len) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
@@ -1321,6 +1420,98 @@ mod tests {
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// One reservation of `n` 64 KiB pages for mapping.
+    fn reserve(n: usize) -> usize {
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        at as usize
+    }
+
+    /// Scatter reads each entry after doing the ones before it: an entry
+    /// that maps over the page holding the list changes those after it.
+    #[test]
+    fn scatter_reads_each_entry_after_the_ones_before() {
+        let pages = allocate(3);
+        let (a, b, c, d) = (reserve(1), reserve(1), reserve(1), reserve(1));
+        // The addresses as they are at `a` (page 0), and as page 1 has them.
+        // (Not the page numbers: their entry's own is read again after its
+        // unmapping.)
+        let list = |at: usize, second: usize| {
+            // SAFETY: `at` is mapped read-write; 2 words.
+            unsafe {
+                let words = at as *mut usize;
+                *words = a;
+                *words.add(1) = second;
+            }
+        };
+        assert_eq!(XMemMapPhysicalPages(b as *mut c_void, 1, &pages[1]), b as *mut c_void);
+        list(b, d);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, &pages[0]), a as *mut c_void);
+        list(a, c);
+        // The first entry maps page 1 at `a`: the second is then `d`.
+        let numbers = [pages[1], pages[2]];
+        assert_eq!(XMemMapPhysicalPagesScatter(a as *const *mut c_void, 2, numbers.as_ptr()), 1);
+        assert_eq!(query(c as *const c_void).host.State, MEM_RESERVE);
+        assert_eq!(query(d as *const c_void).host.State, MEM_COMMIT);
+        for at in [a, b, d] {
+            XMemMapPhysicalPages(at as *mut c_void, 1, std::ptr::null());
+        }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A null address fails its scatter entry, and the entries after it
+    /// are not done.
+    #[test]
+    fn scatter_stops_at_a_null_address() {
+        let pages = allocate(1);
+        let b = reserve(1);
+        let addresses = [std::ptr::null_mut(), b as *mut c_void];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, [0, pages[0]].as_ptr()), 0);
+        assert_eq!(query(b as *const c_void).host.State, MEM_RESERVE);
+        // `VICTORY_REMAP_FAST` finds the null page empty, and the call
+        // still returns its (null) address.
+        assert!(same_pages(&physical(), 0, 1, std::ptr::null()));
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_REMAP_FAST`: a remapping to the pages shown already maps
+    /// nothing, but leaves its views read-write as a remapping would (and
+    /// tells the GPU side, `victory_gpu::title_memory_remapped`).
+    #[test]
+    fn same_page_remaps_reset_protection() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let pages = allocate(3);
+        let (a, b) = (reserve(2), reserve(1));
+        let protect = |at: usize| query(at as *const c_void).host.Protect;
+        let read_only = |at: usize, n: usize| {
+            let mut old = 0;
+            // SAFETY: pages of a view of ours.
+            assert_ne!(unsafe { VirtualProtect(at as *const c_void, n * PAGE, PAGE_READONLY, &mut old) }, 0);
+        };
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, pages.as_ptr()), a as *mut c_void);
+        assert!(map_alias(b as u64, (a + PAGE) as u64, PAGE as u64));
+
+        read_only(a, 2);
+        assert!(!same_pages(&physical(), a + PAGE, 1, &pages[2]), "other pages");
+        assert_eq!(protect(a + PAGE), PAGE_READONLY);
+        assert!(same_pages(&physical(), a + PAGE, 1, &pages[1]));
+        // The whole view, as a remapping maps its rest again.
+        assert_eq!((protect(a), protect(a + PAGE)), (PAGE_READWRITE, PAGE_READWRITE));
+        assert_eq!(physical().views.get(&a).map(|v| v.0), Some(2 * PAGE), "the view stays");
+
+        read_only(b, 1);
+        assert!(!same_alias(&physical(), a, a + PAGE, 2 * PAGE), "a source in the destination");
+        assert!(same_alias(&physical(), b, a + PAGE, PAGE));
+        assert_eq!(protect(b), PAGE_READWRITE);
+
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, std::ptr::null()), a as *mut c_void);
+        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert!(same_pages(&physical(), a, 2, std::ptr::null()), "already empty");
+        assert!(same_alias(&physical(), b, 0, PAGE));
+        assert_eq!(query(a as *const c_void).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
