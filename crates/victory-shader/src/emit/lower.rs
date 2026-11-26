@@ -8,6 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod modes;
+
+use modes::with_lowering_mode;
+
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
@@ -972,10 +976,7 @@ thread_local! {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    with_lowering_mode(&LOCAL_ANY, || with_local_waves(f))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -995,10 +996,7 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    with_lowering_mode(&LOCAL_WAVES, f)
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
@@ -1043,10 +1041,7 @@ thread_local! {
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
 pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
-    let before = FIRST_HALF_PAIRS.replace(true);
-    let result = translate();
-    FIRST_HALF_PAIRS.set(before);
-    result
+    with_lowering_mode(&FIRST_HALF_PAIRS, translate)
 }
 
 pub(super) fn host_max_wave() -> u32 {
