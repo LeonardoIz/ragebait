@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -431,6 +431,48 @@ fn stood(since: std::time::Instant) {
     card_clock_us(2, since.elapsed().as_micros() as u64);
 }
 
+fn fence_reached(completed: u64, target: u64) -> bool {
+    // D3D12 returns UINT64_MAX when the device is removed.
+    completed != u64::MAX && completed >= target
+}
+
+fn poll_fence(
+    target: u64,
+    mut completed: impl FnMut() -> u64,
+    mut device_status: impl FnMut() -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    while !fence_reached(completed(), target) {
+        device_status()?;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// Waits for a value already signalled on the queue. An event failure or
+/// an early wake falls back to polling. Only device removal ends that wait.
+pub(crate) fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, target: u64, event: HANDLE) -> windows::core::Result<()> {
+    // SAFETY: the device and its fence are live; callers own or serialize
+    // access to the event.
+    unsafe {
+        let completed = fence.GetCompletedValue();
+        if fence_reached(completed, target) {
+            return Ok(());
+        }
+        if completed != u64::MAX {
+            match fence.SetEventOnCompletion(target, event) {
+                Ok(()) => {
+                    let waited = WaitForSingleObject(event, INFINITE);
+                    if waited != WAIT_OBJECT_0 {
+                        tracing::warn!(status = waited.0, target, "fence event wait failed; polling instead");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, target, "fence event setup failed; polling instead"),
+            }
+        }
+        poll_fence(target, || fence.GetCompletedValue(), || device.GetDeviceRemovedReason())
+    }
+}
+
 /// What [`CARD_CLOCK_US`] is measured with.
 struct CardClock {
     fence: ID3D12Fence,
@@ -447,7 +489,7 @@ unsafe impl Sync for CardClock {}
 
 /// The clock's thread: waits for the newest signal sent and notes when the
 /// card got there with nothing newer behind it.
-fn card_clock_watch(clock: &'static CardClock) {
+fn card_clock_watch(device: &ID3D12Device, clock: &'static CardClock) {
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         return;
@@ -461,11 +503,8 @@ fn card_clock_watch(clock: &'static CardClock) {
             }
             state.0
         };
-        // SAFETY: the clock's fence and this thread's event.
-        unsafe {
-            if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
+        if wait_for_fence(device, &clock.fence, target, event).is_err() {
+            break;
         }
         seen = target;
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -473,6 +512,8 @@ fn card_clock_watch(clock: &'static CardClock) {
             state.1 = Some((std::time::Instant::now(), worked()));
         }
     }
+    // SAFETY: the watcher owns this event.
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
@@ -3318,11 +3359,8 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
-        // SAFETY: our fence and event.
-        unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
+        if let Err(e) = wait_for_fence(&host.device, &host.fence, target, event) {
+            fail(format_args!("host GPU device removed while waiting for submissions sent ahead ({e})"));
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3458,14 +3496,8 @@ fn relay_worker() {
             Ok(items) => host.relay_land(items, &mut fetch),
             Err(target) => {
                 let waiting = std::time::Instant::now();
-                // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                if let Err(e) = wait_for_fence(&host.device, &host.fence, target, event) {
+                    fail(format_args!("host GPU device removed while waiting for a relay flight ({e})"));
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -4013,7 +4045,8 @@ impl Host {
             })
             .as_ref()?;
         WATCH.call_once(|| {
-            if let Err(e) = std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(clock)) {
+            let device = self.device.clone();
+            if let Err(e) = std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(&device, clock)) {
                 tracing::warn!(error = %e, "no thread for the card's clock: the frame line's idle times stay 0");
             }
         });
@@ -4028,15 +4061,18 @@ impl Host {
             return;
         };
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.0 += 1;
+        let target = state.0 + 1;
         // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        let signalled = unsafe { self.queue.Signal(&clock.fence, target) }.is_ok();
         if let Some((since, worked_then)) = state.1.take() {
             card_clock_us(0, since.elapsed().as_micros() as u64);
             card_clock_us(1, worked().saturating_sub(worked_then));
         }
-        drop(state);
-        clock.sent.notify_one();
+        if signalled {
+            state.0 = target;
+            drop(state);
+            clock.sent.notify_one();
+        }
     }
 
     /// Whether the host has what copies in the card's memory need (three
@@ -4770,8 +4806,7 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
-                fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                wait_for_fence(&self.device, &fence, sent, event)?;
                 Ok(after)
             })()
         };
@@ -5174,12 +5209,11 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
-                    self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    let waited = wait_for_fence(&self.device, &self.fence, *submitted, self.event);
                     stood(waiting);
                     working(was_working);
-                    Ok(())
+                    waited
                 })()
             };
             if let Err(e) = ran {
@@ -5406,19 +5440,11 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                // The submission lock guards the shared event.
+                working(false);
+                let waited = wait_for_fence(&self.device, &self.fence, *submitted, self.event);
+                stood(waiting);
+                working(true);
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5428,7 +5454,7 @@ impl Host {
                     format!("{flights} submissions sent ahead, settled together")
                 });
                 // SAFETY: a plain query.
-                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                if waited.is_err() || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                     let runs: Vec<&HostList> = items
                         .iter()
                         .filter_map(|i| match i {
@@ -5693,23 +5719,23 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists; the fence is ours.
+            let signalled = unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            working(false);
+            let waited = signalled.and_then(|()| wait_for_fence(&self.device, &self.fence, *submitted, self.event));
+            stood(started);
+            working(true);
+            if let Err(e) = waited {
+                fail(format_args!(
+                    "host submission of {} lists could not finish ({e}){}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
@@ -8848,6 +8874,29 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_wait {
+    use super::poll_fence;
+
+    #[test]
+    fn polling_waits_until_the_target_is_reached() {
+        let mut values = [3, 4, 7].into_iter();
+        let mut checks = 0;
+        assert!(poll_fence(6, || values.next().unwrap(), || {
+            checks += 1;
+            Ok(())
+        }).is_ok());
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn a_removed_device_does_not_complete_the_fence() {
+        let reason = windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+        let removed = poll_fence(6, || u64::MAX, || Err(windows::core::Error::from_hresult(reason)));
+        assert_eq!(removed.unwrap_err().code(), reason);
     }
 }
 

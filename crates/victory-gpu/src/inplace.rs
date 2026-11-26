@@ -45,7 +45,7 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
@@ -645,7 +645,7 @@ impl Rig {
         }
     }
 
-    /// Records with `record`, runs it and waits (ten seconds at most).
+    /// Records with `record` and waits for the submitted work to finish.
     fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
@@ -655,12 +655,12 @@ impl Rig {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.done += 1;
-            self.queue.Signal(&self.fence, self.done)?;
-            self.fence.SetEventOnCompletion(self.done, self.event)?;
-            if WaitForSingleObject(self.event, 10_000).0 != 0 {
-                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+            let waited = self.queue.Signal(&self.fence, self.done)
+                .and_then(|()| crate::host::wait_for_fence(&self.device, &self.fence, self.done, self.event));
+            if let Err(e) = waited {
+                crate::host::fail(format_args!("an in-place memory probe submission could not finish ({e})"));
             }
-            self.device.GetDeviceRemovedReason()
+            Ok(())
         }
     }
 
