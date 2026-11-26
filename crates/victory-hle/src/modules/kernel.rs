@@ -143,8 +143,7 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
     LoadLibraryExW(name, std::ptr::null_mut(), 0)
 }
 
-/// Looks up our implementations behind a pseudo handle; real modules go to
-/// the host.
+/// Resolves HLE overrides and exports from the host or a mapped title image.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
@@ -153,7 +152,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        return module_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
@@ -175,23 +174,40 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     }
 }
 
-/// What a host module's `name` (or ordinal) is bound to at import binding
+/// What a title or host module's `name` (or ordinal) is bound to at import binding
 /// when we override it: a title that looks a function up by name must not
 /// get past our overrides (the network guard, path rewriting).
-fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
-    if module.is_null() || runtime::image_path(module as usize).is_some() {
+fn module_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+    if module.is_null() {
         return None;
     }
-    let symbol = if (name as usize) < 0x1_0000 {
-        format!("#{}", name as usize)
-    } else {
-        narrow(name)
-    };
+    if let Some(path) = runtime::image_path(module as usize) {
+        #[cfg(windows)]
+        {
+            let file = path.file_name()?.to_str()?;
+            return super::fidelityfx::lookup(file, &proc_symbol(name))
+                .map(|address| address as *mut c_void);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            return None;
+        }
+    }
+    let symbol = proc_symbol(name);
     let mut path = [0u16; 260];
     let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
     let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
     let file = path.rsplit('\\').next()?;
     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
+}
+
+fn proc_symbol(name: *const u8) -> String {
+    if (name as usize) < 0x1_0000 {
+        format!("#{}", name as usize)
+    } else {
+        narrow(name)
+    }
 }
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`

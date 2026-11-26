@@ -20,6 +20,12 @@ pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
 
+/// Log the selected FidelityFX mode after the console has been set.
+#[cfg(windows)]
+pub fn init_fidelityfx() {
+    modules::fidelityfx::enabled();
+}
+
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
