@@ -2929,7 +2929,10 @@ fn twin_uav(
 const MAX_CBV: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
 
 fn constant_view_size(size: u32) -> u32 {
-    // Cap before rounding so sizes near u32::MAX cannot overflow.
+    // Cap before rounding so sizes near u32::MAX cannot overflow. A view of
+    // no bytes stays one (fork pull request #1260): a shader reads zeros
+    // through it, as on the console; rounded up from 1 it became 256 bytes of
+    // whatever lies at its address in the host copy, and a floor flickered.
     size.min(MAX_CBV).next_multiple_of(256)
 }
 
@@ -3357,6 +3360,14 @@ mod tests {
 
     #[test]
     fn constant_view_size_caps_before_rounding() {
+        assert_eq!(constant_view_size(0), 0);
+        assert_eq!(constant_view_size(1), 256);
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
         assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
     }
 
