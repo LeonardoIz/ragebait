@@ -886,7 +886,14 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    finish_pipeline_recording();
     library::save(true);
+}
+
+/// Waits for the description writer to drain and stop on clean title exit.
+#[cfg(windows)]
+pub fn finish_pipeline_recording() {
+    prebuild::finish();
 }
 
 #[cfg(test)]

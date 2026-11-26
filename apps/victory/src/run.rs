@@ -125,6 +125,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::modules::d3d12x::finish_pipeline_recording();
     println!("title exited with {code}");
     Ok(())
 }
