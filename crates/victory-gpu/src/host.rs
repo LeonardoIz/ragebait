@@ -2398,6 +2398,9 @@ struct Deferred {
     /// With [`declare_once`]: ranges declared written by shaders since the
     /// list last wrote title memory (host copy, address, bytes).
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`keep_once`]: the pipelines [`HostList::keep_pipeline`] kept,
+    /// by address.
+    bound: std::collections::HashSet<usize>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -4161,6 +4164,16 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 fn declare_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a pipeline a list binds again is not kept again
+/// (`VICTORY_KEEP_ONCE=1`; off by default: two interface queries and two
+/// locks at every change of pipeline). After cgbj ab86ef7 (from Belobug
+/// 92d353f8). Its effect is in the frame log ("pipelines bound again, not
+/// kept again").
+fn keep_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -7653,6 +7666,18 @@ impl HostList {
     /// The list's buffers for `crate::indirect::window_check`.
     pub(crate) fn window_check(&self) -> Option<&crate::indirect::WindowCheck> {
         self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
+    }
+
+    /// Keeps a pipeline the list binds, and its root signature, alive until
+    /// the list is reset: with [`keep_once`] the first time only (a kept
+    /// pipeline's address names no other while it is kept).
+    pub(crate) fn keep_pipeline(&self, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        if keep_once() && !self.deferred().bound.insert(pso.as_raw() as usize) {
+            crate::framelog::add(crate::framelog::T::PipelinesKeptAgain, 1);
+            return;
+        }
+        self.keep(pso);
+        self.keep(root);
     }
 
     /// Keeps `object` alive until the list is reset.

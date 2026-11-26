@@ -1694,8 +1694,7 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep_pipeline(&p.pso, &p.root);
         }
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,
