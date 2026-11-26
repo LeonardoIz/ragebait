@@ -62,10 +62,13 @@ const STAGES: [&str; 8] = [
 
 /// Whether title pipelines are recorded for `victory prebuild`. Off by
 /// default (it writes the title's shader containers into the cache
-/// folder); `VICTORY_PSO_PREBUILD=1` records.
+/// folder); `VICTORY_PSO_PREBUILD=1` records. Only while this process
+/// holds the cache folder (`library::dir`): else nothing would save the
+/// queue, which would keep every recorded shader container alive.
 pub(crate) fn recording() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_PREBUILD").is_some_and(|v| v == "1"))
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_PREBUILD").is_some_and(|v| v == "1"));
+    on && super::library::dir().is_some()
 }
 
 /// An input element: its semantic name and the 24 bytes after the name.
