@@ -84,8 +84,8 @@ pub(crate) struct Shadow {
     /// 4 KiB page of title memory (counted from the one `start` lies in)
     /// that a merge of what shaders wrote put bytes into since a refresh
     /// last looked at it ([`Shadow::copy_landed`]); empty until then.
-    landed: Mutex<Vec<u64>>,
-    /// Whether any bit of `landed` may be set.
+    landed: Mutex<(Vec<u64>, usize)>,
+    /// Whether any bit of `landed` is set (the count beside it is not 0).
     landing: std::sync::atomic::AtomicBool,
 }
 
@@ -2174,19 +2174,23 @@ fn land_echo() -> bool {
 
 /// Sets the bits of `bits` (one for each 4 KiB page from page `first` on)
 /// of the pages that title addresses `[from, to)` touch.
-fn note_pages(bits: &mut [u64], first: usize, from: usize, to: usize) {
+fn note_pages(bits: &mut [u64], first: usize, from: usize, to: usize) -> usize {
+    let mut new = 0;
     for page in from / KERNEL_PAGE - first..to.div_ceil(KERNEL_PAGE) - first {
         if let Some(word) = bits.get_mut(page / 64) {
+            new += usize::from(*word >> (page % 64) & 1 == 0);
             *word |= 1 << (page % 64);
         }
     }
+    new
 }
 
 /// Title addresses `[from, to)` as runs of 4 KiB pages noted in `bits` (as
 /// [`note_pages`] sets them) and not noted: (from, to, noted), in order.
 /// The bits of noted pages that lie in the range whole are cleared (a page
-/// looked at in part is looked at again).
-fn take_noted(bits: &mut [u64], first: usize, from: usize, to: usize) -> Vec<(usize, usize, bool)> {
+/// looked at in part is looked at again), and taken off `left` (the
+/// count of bits set, as [`note_pages`] returns them).
+fn take_noted(bits: &mut [u64], first: usize, from: usize, to: usize, left: &mut usize) -> Vec<(usize, usize, bool)> {
     let mut runs: Vec<(usize, usize, bool)> = Vec::new();
     let mut at = from;
     while at < to {
@@ -2195,6 +2199,7 @@ fn take_noted(bits: &mut [u64], first: usize, from: usize, to: usize) -> Vec<(us
         let noted = bits.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0);
         if noted && next - at == KERNEL_PAGE {
             bits[page / 64] &= !(1 << (page % 64));
+            *left = left.saturating_sub(1);
         }
         match runs.last_mut() {
             Some(last) if last.2 == noted => last.1 = next,
@@ -2235,18 +2240,21 @@ mod land_echo_tests {
         let first = 100;
         let base = first * P;
         let mut bits = vec![0u64; 2];
-        // Pages 1 and 2 (in part), and 70.
-        note_pages(&mut bits, first, base + P + 5, base + 2 * P + 1);
-        note_pages(&mut bits, first, base + 70 * P, base + 70 * P + 8);
+        // Pages 1 and 2 (in part), and 70; page 70 again counts once.
+        let mut left = note_pages(&mut bits, first, base + P + 5, base + 2 * P + 1);
+        left += note_pages(&mut bits, first, base + 70 * P, base + 70 * P + 8);
+        left += note_pages(&mut bits, first, base + 70 * P, base + 70 * P + 8);
+        assert_eq!(left, 3);
         // Page 2 looked at in part only: noted still.
         assert_eq!(
-            take_noted(&mut bits, first, base + 100, base + 2 * P + 9),
+            take_noted(&mut bits, first, base + 100, base + 2 * P + 9, &mut left),
             [(base + 100, base + P, false), (base + P, base + 2 * P + 9, true)]
         );
-        assert_eq!(take_noted(&mut bits, first, base + P, base + 3 * P), [(base + P, base + 2 * P, false), (base + 2 * P, base + 3 * P, true)]);
-        assert_eq!(take_noted(&mut bits, first, base, base + 3 * P), [(base, base + 3 * P, false)]);
-        assert_eq!(take_noted(&mut bits, first, base + 70 * P, base + 71 * P), [(base + 70 * P, base + 71 * P, true)]);
+        assert_eq!(take_noted(&mut bits, first, base + P, base + 3 * P, &mut left), [(base + P, base + 2 * P, false), (base + 2 * P, base + 3 * P, true)]);
+        assert_eq!(take_noted(&mut bits, first, base, base + 3 * P, &mut left), [(base, base + 3 * P, false)]);
+        assert_eq!(take_noted(&mut bits, first, base + 70 * P, base + 71 * P, &mut left), [(base + 70 * P, base + 71 * P, true)]);
         assert_eq!(bits, [0, 0]);
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -4098,11 +4106,12 @@ impl Shadow {
         }
         let (start, first) = (self.start as usize, self.start as usize / KERNEL_PAGE);
         let mut bits = self.landed.lock().unwrap_or_else(|e| e.into_inner());
+        let (bits, left) = &mut *bits;
         if bits.is_empty() {
             let pages = (start + self.len as usize).div_ceil(KERNEL_PAGE) - first;
             bits.resize(pages.div_ceil(64), 0);
         }
-        note_pages(&mut bits, first, start + from, start + to);
+        *left += note_pages(bits, first, start + from, start + to);
         self.landing.store(true, Ordering::Release);
     }
 
@@ -4115,7 +4124,17 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let start = self.start as usize;
-        let runs = take_noted(&mut self.landed.lock().unwrap_or_else(|e| e.into_inner()), start / KERNEL_PAGE, from, to);
+        let runs = {
+            let mut landed = self.landed.lock().unwrap_or_else(|e| e.into_inner());
+            let (bits, left) = &mut *landed;
+            let runs = take_noted(bits, start / KERNEL_PAGE, from, to, left);
+            // The last noted page taken: the fast path is off again (under
+            // the lock, so a page noted meanwhile sets it after).
+            if *left == 0 {
+                self.landing.store(false, Ordering::Release);
+            }
+            runs
+        };
         for (a, b, noted) in runs {
             if !noted {
                 self.copy_plain(a, b);
