@@ -1835,17 +1835,13 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let _reading = if evict {
-                let Some(reading) = crate::watch::title_memory_reading_now() else { continue };
-                Some(reading)
-            } else {
-                None
-            };
+            // As many go with eviction on as off: the next use uploads title memory
+            // either way. Eviction also keeps alias-copied (`THROUGH`) contents.
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
-                    && if evict { eviction::reloadable(at, r) } else { !crate::texture::host_wrote(at) }
+                    && if evict { !crate::texture::has_host_contents(at) } else { !crate::texture::host_wrote(at) }
             });
             if idle {
                 // Under the lock: the next use must not find the staging
