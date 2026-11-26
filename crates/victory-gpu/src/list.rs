@@ -140,19 +140,25 @@ const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
-/// is a host GPU.
+/// is a host GPU. Returns the default value when there is no host list.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+pub(crate) fn with_state<R: Default>(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State) -> R,
+) -> R {
+    let Some(list) = host_list(this) else {
+        return R::default();
+    };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let result = f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
     crate::profile::seen(crate::profile::Seen::Record);
+    result
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

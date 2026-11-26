@@ -54,6 +54,10 @@ pub fn registry() -> &'static [HleModule] {
 }
 
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
+    #[cfg(windows)]
+    if let Some(address) = modules::fidelityfx::lookup(dll, name) {
+        return Some(address);
+    }
     registry()
         .iter()
         .filter(|m| m.serves(dll))

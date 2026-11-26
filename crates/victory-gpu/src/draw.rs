@@ -690,6 +690,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Our blit recorded with its own host bindings. Rebind title state next.
+    pub(crate) fn external_dispatch(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.window = None;
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
