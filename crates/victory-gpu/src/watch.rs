@@ -738,7 +738,37 @@ fn rest() -> std::time::Duration {
 /// ... views left read-only").
 fn open_one_view() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if ONE_VIEW_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
     *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`open_one_view`] on for this thread (faults are handled on
+    /// the faulting thread).
+    static ONE_VIEW_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`open_one_view`]: before guarded `block` is noted clean, the views
+/// of its pages a fault left writable are made read-only again, or a later
+/// write through them would fault nothing and the block would stay clean.
+/// False if one of them could not be (then the block stays not clean).
+fn rearm_aliases(g: &mut Guards, block: usize) -> bool {
+    if !open_one_view() || !g.aliased.contains(&block) {
+        return true;
+    }
+    let mut all = true;
+    for alias in crate::inplace::pages_of(block * BLOCK) {
+        let alias = alias / BLOCK;
+        if alias != block && g.aliased.contains(&alias) && !g.protected.contains(&alias) {
+            protect_alias(g, alias);
+            all &= g.protected.contains(&alias);
+        }
+    }
+    all
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -1028,7 +1058,9 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                if rearm_aliases(&mut g, block) {
+                    g.clean.insert(block);
+                }
             } else if g.rests(block, rest) {
                 // Just written by the title: left open, written again next
                 // time.
@@ -2155,6 +2187,30 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// With `VICTORY_OPEN_ONE_VIEW`: a write through one view opens it and
+    /// leaves the other not clean; the other's check must make the first
+    /// read-only again before it notes itself clean, or a second write
+    /// through the first faults nothing and the other's copy goes stale.
+    #[test]
+    fn one_view_writes_twice_with_a_check_of_the_other_between() {
+        const SIZE: usize = BLOCK;
+        ONE_VIEW_HERE.with(|on| on.set(true));
+        let (section, a, b) = two_views(SIZE);
+        let page = b / PAGE;
+        assert_eq!(guard(a, a + SIZE), Some(vec![a / PAGE]));
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]), "guarded with a, not yet taken");
+        assert_eq!(guard(b, b + SIZE), Some(Vec::new()), "nothing written yet");
+        // SAFETY: view a, read-write once the handler has opened it.
+        unsafe { ((a + 8) as *mut u8).write(1) };
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]));
+        // SAFETY: as above; it must fault again.
+        unsafe { ((a + 16) as *mut u8).write(2) };
+        assert_eq!(guard(b, b + SIZE), Some(vec![page]), "the second write is seen too");
+        assert_eq!(guard(b, b + SIZE), Some(Vec::new()));
+        ONE_VIEW_HERE.with(|on| on.set(false));
+        drop_views(section, &[a, b], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the
