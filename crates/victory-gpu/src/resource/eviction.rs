@@ -40,6 +40,12 @@ fn excess(used: u64, limit: u64) -> u64 {
     }
 }
 
+/// Keep room for pending copies without trimming into the part of the
+/// texture cache that admission would immediately fill again.
+fn reserved_pressure(used: u64, limit: u64, filled: u64) -> u64 {
+    excess(used, limit).min(filled.saturating_sub(super::TEXTURE_ROOM_FLOOR))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Candidate {
     used: u64,
@@ -95,11 +101,25 @@ pub(super) fn reloadable(address: usize, resource: &Resource) -> bool {
 /// a pending upload, or a descriptor that can still be indexed by a shader
 /// keeps an Arc or COM reference of its own.
 pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
-    let (mut local, mut textures_needed) = pressure(video, texture_bytes(), texture_budget());
+    let filled = texture_bytes();
+    let cap = texture_budget();
+    let (mut local, mut textures_needed) = pressure(video, filled, cap);
+    let mut reserved = 0;
+    let mut above_floor = filled.saturating_sub(super::TEXTURE_ROOM_FLOOR);
+    if crate::shadow::card_room_shared()
+        && cap.is_none()
+        && let Some([budget, used, ..]) = video
+    {
+        reserved = reserved_pressure(
+            super::texture_vram_used(used),
+            super::texture_vram_limit(budget),
+            filled,
+        );
+    }
     if ALLOCATION_FAILED.swap(false, Relaxed) {
         local = local.max(HEADROOM);
     }
-    if local == 0 && textures_needed == 0 {
+    if local == 0 && textures_needed == 0 && reserved == 0 {
         return;
     }
     let mut retired = Vec::new();
@@ -119,7 +139,7 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
         }
         candidates.sort_unstable();
         for Candidate { used, address } in candidates {
-            if (local == 0 && textures_needed == 0) || retired.len() == MAX_VICTIMS {
+            if (local == 0 && textures_needed == 0 && reserved == 0) || retired.len() == MAX_VICTIMS {
                 break;
             }
             // SAFETY: the same table lock still protects this resource.
@@ -146,12 +166,15 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
             // under the texture cap, but cannot be credited to DXGI.
             if bytes == 0
                 || (host.bytes == 0 && textures_needed == 0)
+                || (local == 0 && textures_needed == 0 && bytes > above_floor)
                 || !reloadable(address, resource)
             {
                 continue;
             }
             local = local.saturating_sub(host.bytes);
             textures_needed = textures_needed.saturating_sub(bytes);
+            above_floor = above_floor.saturating_sub(bytes);
+            reserved = reserved.saturating_sub(host.bytes).min(above_floor);
             let stage = crate::texture::take_staged(address as This);
             retired.push((made.take(), stage));
             resource.host.gone.store(true, Relaxed);
@@ -172,7 +195,17 @@ pub(crate) fn evict_if_pressured(video: Option<[u64; 4]>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, HEADROOM, candidate, pressure};
+    use super::{Candidate, HEADROOM, candidate, pressure, reserved_pressure};
+
+    #[test]
+    fn reservation_trims_only_above_the_admission_floor() {
+        let floor = super::super::TEXTURE_ROOM_FLOOR;
+        let limit = 7 << 30;
+        assert_eq!(reserved_pressure(limit - 1, limit, floor + HEADROOM), 0);
+        assert_eq!(reserved_pressure(limit + 1, limit, floor), 0);
+        assert_eq!(reserved_pressure(limit + 1, limit, floor + 1), 1);
+        assert_eq!(reserved_pressure(limit, limit, floor + HEADROOM), HEADROOM);
+    }
 
     #[test]
     fn pressure_respects_both_budgets() {
