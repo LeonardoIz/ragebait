@@ -299,12 +299,22 @@ struct Made {
     pitch: u32,
 }
 
+fn retry_upload<T>(retry_at: &mut Option<Instant>, now: impl Fn() -> Instant, create: impl FnOnce() -> Option<T>) -> Option<T> {
+    if retry_at.is_some_and(|at| now() < at) {
+        return None;
+    }
+    let made = create();
+    *retry_at = made.is_none().then(|| now() + Duration::from_secs(1));
+    made
+}
+
 pub(crate) struct Overlay {
     on: bool,
     stats: bool,
     rate: Option<(u32, u32)>,
     /// Only the current text, format and scale are cached.
     made: Option<((Display, DXGI_FORMAT, u32), Made)>,
+    retry_at: Option<Instant>,
 }
 
 impl Overlay {
@@ -328,6 +338,7 @@ impl Overlay {
             stats,
             rate: None,
             made: None,
+            retry_at: None,
         }
     }
 
@@ -354,7 +365,9 @@ impl Overlay {
         let scale = (height / 360).clamp(2, 12);
         let key = (display, format, scale);
         if self.made.as_ref().is_none_or(|(old, _)| *old != key) {
-            self.made = Made::new(host, &display.text(), format, scale, bytes).map(|made| (key, made));
+            self.made = retry_upload(&mut self.retry_at, Instant::now, || {
+                Made::new(host, &display.text(), format, scale, bytes).map(|made| (key, made))
+            });
         }
         let Some((_, made)) = self.made.as_ref() else {
             return;
@@ -422,6 +435,23 @@ impl Made {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_upload_skips_rebuilds_for_one_second() {
+        let start = Instant::now();
+        let failed = start + Duration::from_millis(40);
+        let now = std::cell::Cell::new(start);
+        let mut retry_at = Some(start);
+        assert_eq!(retry_upload::<()>(&mut retry_at, || now.get(), || {
+            now.set(failed);
+            None
+        }), None);
+        now.set(failed + Duration::from_millis(999));
+        assert_eq!(retry_upload::<()>(&mut retry_at, || now.get(), || panic!("rebuilt during the cooldown")), None);
+        now.set(failed + Duration::from_secs(1));
+        assert_eq!(retry_upload(&mut retry_at, || now.get(), || Some(())), Some(()));
+        assert_eq!(retry_at, None);
+    }
 
     #[test]
     fn formats_the_fps_line_and_optional_resource_lines() {

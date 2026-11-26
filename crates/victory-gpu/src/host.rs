@@ -6214,7 +6214,13 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            let mut next = Deferred::default();
+            deferred.kept.clear();
+            std::mem::swap(&mut next.kept, &mut deferred.kept);
+            *deferred = next;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
