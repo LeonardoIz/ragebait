@@ -714,10 +714,13 @@ fn observe_remap(
         .map(|at| view_at(&physical.views, at).map(|(slice, k)| backing(slice, k)))
         .collect();
     let timers = remap_stats::timing();
+    let calls = remap_stats::os_calls();
     let start = std::time::Instant::now();
     let ok = remap(physical);
     let elapsed = start.elapsed().as_micros() as u64;
     let end = remap_stats::timing();
+    let after = remap_stats::os_calls();
+    let os = std::array::from_fn(|i| after[i].wrapping_sub(calls[i]));
     let [unmap, map, commit, wait] = std::array::from_fn(|i| end[i].wrapping_sub(timers[i]));
     let book = elapsed.saturating_sub(unmap + map + commit + wait);
     let pages = targets().zip(before).map(|(at, before)| {
@@ -735,6 +738,7 @@ fn observe_remap(
         len.div_ceil(PAGE),
         ok,
         [unmap, map, commit, wait, book],
+        os,
         pages,
     );
     ok
@@ -889,6 +893,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    if remap_batch() {
+        return scatter_batched(addresses, n, pages);
+    }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -1028,6 +1035,241 @@ fn reset_in(physical: &Physical, base: usize, len: usize) {
         let offset = (slice.index * PAGE) as u64;
         victory_gpu::title_memory_refreshed(at, *size, slice.section.handle as usize, offset, from, to - from);
     }
+}
+
+/// `VICTORY_REMAP_BATCH=1`: the GPU's page-mapping copies ([`map_aliases`])
+/// and [`XMemMapPhysicalPagesScatter`] join mappings of neighbouring pages
+/// within one call before applying them: one unmapping pass over each run
+/// of destination pages (a view is taken away once, not cut again page
+/// after page), then one view per run of consecutive slices of one section
+/// ([`map_run`], so fewer views to take away later), under one remapping
+/// lock per run. Pages that show what they are to show already are only
+/// [`reset_in`], as with `VICTORY_MAP_RUNS`. Nothing is deferred past the
+/// call: the title, and the next submission, see every mapping when it
+/// returns. Off by default, for A/B runs with `VICTORY_REMAP_STATS=1`
+/// (its `os_calls`).
+pub(crate) fn remap_batch() -> bool {
+    static BATCH: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_REMAP_BATCH").is_ok_and(|v| v.trim() == "1"));
+    *BATCH
+}
+
+/// Whether a mapping of `len` bytes at `to` from `from` (`from` 0 unmaps;
+/// one source page if `repeat`) can join pending pages `[start, end)`: it
+/// carries on where they end, is whole pages, and reads no page they or it
+/// change (so its sources read now are what they would be read in turn).
+/// `start == end == to` asks whether it can begin a run.
+fn joins(start: usize, end: usize, to: usize, from: usize, len: usize, repeat: bool) -> bool {
+    let source = if repeat { PAGE } else { len };
+    let (Some(last), Some(read_end)) = (to.checked_add(len), from.checked_add(source)) else {
+        return false;
+    };
+    to == end
+        && [to, from, len].iter().all(|v| v % PAGE == 0)
+        && (from == 0 || read_end <= start || from >= last)
+}
+
+/// What a joined run does to some of its pages.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// The pages show what they are to show already.
+    Same,
+    /// The pages are unmapped (in one pass), then mapped by the `Map`s
+    /// that follow inside them.
+    Clear,
+    /// Pages to show consecutive slices of one section, as one view.
+    Map,
+}
+
+/// A joined run's steps `(first, end, step)` from what each page is to
+/// show (`wanted`, by [`Slice::key`], `None` for nothing) and whether it
+/// does already (`same`).
+fn batch_plan(wanted: &[Option<(usize, usize)>], same: &[bool]) -> Vec<(usize, usize, Step)> {
+    let follows = |k: usize| match (wanted[k - 1], wanted[k]) {
+        (Some(a), Some(b)) => a.0 == b.0 && b.1 == a.1 + 1,
+        _ => false,
+    };
+    let mut plan = Vec::new();
+    let mut first = 0;
+    while first < wanted.len() {
+        let end = first
+            + same[first..]
+                .iter()
+                .take_while(|&&s| s == same[first])
+                .count();
+        if same[first] {
+            plan.push((first, end, Step::Same));
+        } else {
+            plan.push((first, end, Step::Clear));
+            let mut k = first;
+            while k < end {
+                if wanted[k].is_none() {
+                    k += 1;
+                    continue;
+                }
+                let run = 1 + (k + 1..end).take_while(|&j| follows(j)).count();
+                plan.push((k, k + run, Step::Map));
+                k += run;
+            }
+        }
+        first = end;
+    }
+    plan
+}
+
+/// Applies a joined run from `base` (what each page is to show) under the
+/// remapping lock, as one observed call; empties `wanted`.
+fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let len = wanted.len() * PAGE;
+    let ok = observe_remap(physical, base, len, |physical| {
+        // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+        let _changing = victory_gpu::title_memory_remapping();
+        let keys: Vec<_> = wanted
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.key(0)))
+            .collect();
+        let same: Vec<bool> = keys
+            .iter()
+            .enumerate()
+            .map(|(k, w)| slice_at(&physical.views, base + k * PAGE).map(|s| s.key(0)) == *w)
+            .collect();
+        for (first, end, step) in batch_plan(&keys, &same) {
+            let (at, bytes) = (base + first * PAGE, (end - first) * PAGE);
+            match step {
+                Step::Same => {
+                    victory_gpu::framelog::add(victory_gpu::framelog::T::RemapSkips, 1);
+                    reset_in(physical, at, bytes);
+                }
+                Step::Clear => unmap(physical, at, bytes),
+                Step::Map => {
+                    let Some(slice) = wanted[first].clone() else {
+                        unreachable!("a map step starts at a page to map")
+                    };
+                    if !map_run(physical, at, end - first, &slice) {
+                        // As in `alias_in_runs`: what was not done yet shows nothing.
+                        unmap(physical, at, base + len - at);
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    });
+    wanted.clear();
+    ok
+}
+
+/// [`map_alias`] for a whole page-mapping copy, in order
+/// ([`victory_gpu::resource::PageBatchMapper`]), neighbouring pages joined
+/// ([`remap_batch`]). It leaves what the mappings would leave one after
+/// another, failures included.
+pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
+    let mut guard = physical();
+    let physical = &mut *guard;
+    let (mut ok, mut base, mut wanted) = (true, 0, Vec::new());
+    for &(to, from, len, repeat) in ops {
+        let (to, from, len) = (to as usize, from as usize, len as usize);
+        if len == 0 {
+            continue;
+        }
+        let end = base + wanted.len() * PAGE;
+        if !wanted.is_empty() && !joins(base, end, to, from, len, repeat) {
+            ok &= flush(physical, base, &mut wanted);
+        }
+        if wanted.is_empty() {
+            if !joins(to, to, to, from, len, repeat) {
+                // Not whole pages, or reading what it changes: on its own.
+                let mut alone =
+                    |to, len| observe_remap(physical, to, len, |p| remap_alias(p, to, from, len));
+                ok &= if repeat {
+                    (0..len).step_by(PAGE).all(|k| alone(to + k, PAGE))
+                } else {
+                    alone(to, len)
+                };
+                continue;
+            }
+            base = to;
+        }
+        let pages = len / PAGE;
+        if from == 0 {
+            wanted.resize(wanted.len() + pages, None);
+        } else if repeat {
+            match slice_at(&physical.views, from) {
+                Some(slice) => wanted.resize(wanted.len() + pages, Some(slice)),
+                // One after another, the first page is unmapped and fails,
+                // and the pages after it are left as they are.
+                None => {
+                    wanted.push(None);
+                    ok = false;
+                }
+            }
+        } else {
+            let found: Vec<_> = (0..pages)
+                .map_while(|k| slice_at(&physical.views, from + k * PAGE))
+                .collect();
+            ok &= found.len() == pages;
+            let missing = pages - found.len();
+            wanted.extend(found.into_iter().map(Some));
+            wanted.resize(wanted.len() + missing, None);
+        }
+    }
+    ok & flush(physical, base, &mut wanted)
+}
+
+/// [`XMemMapPhysicalPagesScatter`] with [`remap_batch`]: neighbouring
+/// addresses joined. An unknown page ends the call as it would one after
+/// another (that address unmapped, those after it left alone).
+// shortcut: a host failure to map (commit limit) inside a joined run also
+// unmaps that run's later addresses, which one after another would stay as
+// they were; only matters after a failure that is fatal anyway.
+fn scatter_batched(addresses: *const *mut c_void, n: usize, pages: *const usize) -> BOOL {
+    let mut guard = physical();
+    let physical = &mut *guard;
+    let (mut base, mut wanted) = (0, Vec::new());
+    for i in 0..n {
+        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        let (at, page) = unsafe {
+            (
+                *addresses.add(i) as usize,
+                if pages.is_null() || *pages.add(i) == 0 {
+                    std::ptr::null()
+                } else {
+                    pages.add(i)
+                },
+            )
+        };
+        let slice = if page.is_null() {
+            Some(None)
+        } else {
+            // SAFETY: checked non-null above.
+            physical.pages.get(&unsafe { *page }).cloned().map(Some)
+        };
+        let end = base + wanted.len() * PAGE;
+        if !wanted.is_empty()
+            && (slice.is_none() || !joins(base, end, at, 0, PAGE, false))
+            && !flush(physical, base, &mut wanted)
+        {
+            return 0;
+        }
+        let Some(slice) = slice else {
+            observe_remap(physical, at, PAGE, |p| map_pages(p, at, 1, page));
+            return 0;
+        };
+        if wanted.is_empty() {
+            if !joins(at, at, at, 0, PAGE, false) {
+                if !observe_remap(physical, at, PAGE, |p| map_pages(p, at, 1, page)) {
+                    return 0;
+                }
+                continue;
+            }
+            base = at;
+        }
+        wanted.push(slice);
+    }
+    BOOL::from(flush(physical, base, &mut wanted))
 }
 
 /// Maps `pages` slices from `slice` on at `base`, where only placeholders
@@ -1222,6 +1464,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         };
         add(T::RemapUnmapUs, noted.elapsed().as_micros() as u64);
+        add(T::RemapUnmaps, 1);
         // What of the view lies outside the range asked for is mapped
         // again below: the whole view went for it.
         let outside = base.saturating_sub(at) + (at + size).saturating_sub(end);
@@ -1849,6 +2092,166 @@ mod tests {
     }
 
     /// `n` pages of one new allocation.
+    /// `VICTORY_REMAP_BATCH`: which mappings join a pending run, and the
+    /// steps a joined run takes.
+    #[test]
+    fn batches_join_neighbours_and_plan_one_clear_per_change() {
+        const P: usize = PAGE;
+        // Carries on where the run ends, whole pages.
+        assert!(joins(10 * P, 12 * P, 12 * P, 0, P, false));
+        assert!(!joins(10 * P, 12 * P, 13 * P, 0, P, false), "a gap");
+        assert!(!joins(10 * P, 12 * P, 11 * P, 0, P, false), "a page again");
+        assert!(
+            !joins(12 * P, 12 * P, 12 * P, 0, P / 2, false),
+            "not whole pages"
+        );
+        // A source the run or the mapping itself changes is read in turn.
+        assert!(!joins(10 * P, 12 * P, 12 * P, 11 * P, P, false));
+        assert!(!joins(12 * P, 12 * P, 12 * P, 13 * P, 2 * P, false));
+        assert!(joins(12 * P, 12 * P, 12 * P, 14 * P, 2 * P, false));
+        assert!(joins(10 * P, 12 * P, 12 * P, 2 * P, 8 * P, false));
+        assert!(!joins(10 * P, 12 * P, 12 * P, 3 * P, 8 * P, false));
+        // A repeated page reads only its first source page.
+        assert!(joins(10 * P, 12 * P, 12 * P, 9 * P, 8 * P, true));
+
+        let (a, b) = (1, 2);
+        let wanted = [
+            Some((a, 0)),
+            Some((a, 1)),
+            Some((a, 2)),
+            None,
+            Some((b, 5)),
+            Some((b, 5)),
+            None,
+        ];
+        let same = [true, false, false, false, false, false, true];
+        assert_eq!(
+            batch_plan(&wanted, &same),
+            [
+                (0, 1, Step::Same),
+                (1, 6, Step::Clear),
+                (1, 3, Step::Map),
+                (4, 5, Step::Map),
+                (5, 6, Step::Map),
+                (6, 7, Step::Same),
+            ]
+        );
+        assert_eq!(batch_plan(&[], &[]), []);
+    }
+
+    /// `VICTORY_REMAP_BATCH` on real views: a page-mapping copy leaves
+    /// what its mappings would one after another, in fewer, larger views.
+    #[test]
+    fn batched_page_mapping_copies_match_one_after_another() {
+        let view = |at: usize| physical().views.get(&at).map(|v| v.0 / PAGE);
+        let pages = allocate(4);
+        let (a, b) = (reserve(4), reserve(6));
+        assert_eq!(
+            XMemMapPhysicalPages(a as *mut c_void, 4, pages.as_ptr()),
+            a as *mut c_void
+        );
+        for k in 0..4 {
+            // SAFETY: mapped read-write.
+            unsafe { ((a + k * PAGE) as *mut u8).write(60 + k as u8) };
+        }
+        // SAFETY: read only while mapped.
+        let shows = |at: usize| unsafe { (at as *const u8).read() };
+        let (p, a, b) = (PAGE as u64, a as u64, b as u64);
+        // Two copies of consecutive pool pages become one view; a repeated
+        // page is a view per page.
+        assert!(map_aliases(&[
+            (b, a, 2 * p, false),
+            (b + 2 * p, a + 2 * p, 2 * p, false),
+            (b + 4 * p, a, 2 * p, true)
+        ]));
+        let (b, a) = (b as usize, a as usize);
+        assert_eq!(
+            (view(b), view(b + 4 * PAGE), view(b + 5 * PAGE)),
+            (Some(4), Some(1), Some(1))
+        );
+        let got: Vec<u8> = (0..6).map(|k| shows(b + k * PAGE)).collect();
+        assert_eq!(got, [60, 61, 62, 63, 60, 60]);
+        // Unmapping the middle cuts the view once; a mapping that reads a
+        // page the run before it changes reads it after that change.
+        let (p, a64, b64) = (PAGE as u64, a as u64, b as u64);
+        assert!(map_aliases(&[
+            (b64 + p, 0, 2 * p, false),
+            (b64, a64 + 3 * p, p, false),
+            (b64 + p, b64, p, false)
+        ]));
+        assert_eq!(
+            query((b + 2 * PAGE) as *const c_void).host.State,
+            MEM_RESERVE
+        );
+        assert_eq!(
+            (shows(b), shows(b + PAGE), shows(b + 3 * PAGE)),
+            (63, 63, 63)
+        );
+        // A repeated page with no source: its first page is unmapped and
+        // fails, those after it stay; the mappings after it still happen.
+        let hole = b64 + 2 * p;
+        assert!(!map_aliases(&[
+            (b64 + 4 * p, hole, 2 * p, true),
+            (b64 + 2 * p, a64 + p, p, false)
+        ]));
+        assert_eq!(
+            query((b + 4 * PAGE) as *const c_void).host.State,
+            MEM_RESERVE
+        );
+        assert_eq!((shows(b + 5 * PAGE), shows(b + 2 * PAGE)), (60, 61));
+        // A copy whose source ends: what came before is mapped, the rest not.
+        assert!(!map_aliases(&[
+            (b64 + 3 * p, 0, p, false),
+            (b64 + 4 * p, b64 + 2 * p, 2 * p, false)
+        ]));
+        assert_eq!(shows(b + 4 * PAGE), 61);
+        assert_eq!(
+            query((b + 5 * PAGE) as *const c_void).host.State,
+            MEM_RESERVE
+        );
+        assert!(map_aliases(&[(b64, 0, 6 * p, false)]));
+        assert!(views_in(&physical(), b, 6 * PAGE).is_empty());
+        assert_eq!(
+            XMemMapPhysicalPages(a as *mut c_void, 4, std::ptr::null()),
+            a as *mut c_void
+        );
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_REMAP_BATCH`'s scatter: neighbouring addresses with
+    /// consecutive pages are one view; an unknown page unmaps its address
+    /// and ends the call there.
+    #[test]
+    fn batched_scatter_joins_neighbours_and_stops_at_an_unknown_page() {
+        let view = |at: usize| physical().views.get(&at).map(|v| v.0 / PAGE);
+        let pages = allocate(3);
+        let b = reserve(4);
+        let at = |k: usize| (b + k * PAGE) as *mut c_void;
+        assert_eq!(
+            scatter_batched([at(0), at(1), at(2)].as_ptr(), 3, pages.as_ptr()),
+            1
+        );
+        assert_eq!(view(b), Some(3));
+        let unknown = [pages[0], 0x10, pages[2]];
+        assert_eq!(
+            scatter_batched([at(3), at(1), at(0)].as_ptr(), 3, unknown.as_ptr()),
+            0
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        {
+            let physical = physical();
+            let first = physical.pages.get(&pages[0]).map(|s| s.key(0));
+            assert_eq!(slice_at(&physical.views, b).map(|s| s.key(0)), first);
+            assert_eq!(slice_at(&physical.views, b + 3 * PAGE).map(|s| s.key(0)), first);
+        }
+        assert_eq!(
+            scatter_batched([at(0), at(2), at(3)].as_ptr(), 3, std::ptr::null()),
+            1
+        );
+        assert!(views_in(&physical(), b, 4 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
         assert_eq!(

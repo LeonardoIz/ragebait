@@ -1581,6 +1581,19 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // `VICTORY_REMAP_BATCH`: the mappings are gathered in order and handed
+    // over at once below, before this call returns (nothing can see them
+    // sooner: earlier submissions have run, later ones come after).
+    let batch = crate::resource::page_batch_mapper();
+    let mut ops = Vec::new();
+    let mut map = |to, from, len, repeat| match batch {
+        Some(_) => {
+            ops.push((to, from, len, repeat));
+            true
+        }
+        None if repeat => (0..len / PAGE).all(|k| map(to + k * PAGE, from, PAGE)),
+        None => map(to, from, len),
+    };
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1594,14 +1607,17 @@ extern "system" fn copy_page_mappings(
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
+                0 if inside(r.count) => map(at, source, len, false),
+                1 if inside(1) => map(at, source, len, true),
+                2 => map(at, 0, len, false),
                 3 => true,
                 _ => false,
             };
             at += len;
         }
+    }
+    if let Some(batch) = batch {
+        ok &= batch(&ops);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();

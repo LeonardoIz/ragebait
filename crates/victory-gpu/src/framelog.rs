@@ -122,6 +122,10 @@ pub enum T {
     /// (`VICTORY_MAP_RUNS` maps a run of pages as one view).
     RemapViews,
     RemapPages,
+    /// The system's unmapping calls behind those changes (one per view
+    /// taken away), for `VICTORY_REMAP_STATS`' count of them beside
+    /// [`T::RemapViews`] (`VICTORY_REMAP_BATCH`).
+    RemapUnmaps,
     /// The pass over the title's view heaps (`crate::descriptor::sync_heaps`):
     /// its time on whichever thread, and the changed heap pages it read.
     HeapSyncUs,
