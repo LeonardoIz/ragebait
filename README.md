@@ -66,6 +66,23 @@ target\release\victory.exe translate --warm all --jobs 16   # no paths: game_dir
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+To prebuild pipeline state objects (PSOs), set `$env:VICTORY_PSO_PREBUILD = '1'`
+in PowerShell and run the game to record the pipelines it uses. Close the game,
+clear the switch with `Remove-Item Env:VICTORY_PSO_PREBUILD`, and run
+`target\release\victory.exe prebuild --jobs 4`. Then play normally. Rerun
+prebuild after a driver or translator change.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `VICTORY_STATS` | On | Show resource statistics in the FPS overlay |
+| `VICTORY_PRESENT_COMPOSITE` | On | Composite multi-plane presents |
+| `VICTORY_FFX_PASSTHROUGH` | On for Series S, off for Series X | Use a scaled copy in place of the console FidelityFX upscaler |
+| `VICTORY_WAVE_WIDE_SEEN` | On | Enable wave-wide branches for the built-in list of shader hashes |
+| `VICTORY_WAVE_WIDE_LIST` | Empty | Add comma-separated shader hashes to that selection |
+| `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
+| `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
+| `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |
+
 The best switch set measured so far is in
 [diagnostics/README.md](diagnostics/README.md). Each `VICTORY_*` switch is
 described in a comment where it is read.
