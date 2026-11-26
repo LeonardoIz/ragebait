@@ -136,6 +136,28 @@ fn lowered_on(
 }
 
 #[test]
+fn a_swap_with_a_uniform_register_keeps_the_lane_value_lane_dependent() {
+    // v0 (the thread id) is a per-lane LDS address; after the swap v5 holds it. The swap's
+    // source v5 was uniform, but its destination v0 was not: the read from v5 must not be
+    // taken as uniform, or the Wave64 exchange is skipped and both halves read one word.
+    let words: [u32; 6] = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E00_CB05, // v_swap_b32 v0, v5
+        0xD8D8_0000,
+        0x0600_0005, // ds_read_b32 v6, v5
+        0x7E00_0506, // v_readfirstlane_b32 s0, v6
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let read = p.blocks[0].insts.iter().find(|i| i.name() == "ds_read_b32").unwrap();
+    let same = lower::lane_uniform(&p, &st, &[true], true);
+    assert!(!same.contains(&read.read(ir::Reg::V(5)).unwrap()));
+    assert!(!same.contains(&read.writes[0].1));
+}
+
+#[test]
 fn scalar_select_reads_mask_scc_across_host_waves() {
     let native = native(&[
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0

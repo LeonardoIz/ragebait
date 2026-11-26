@@ -452,7 +452,7 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
+pub(super) fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -491,10 +491,10 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -
                 _ => continue,
             };
             let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
+                Operand::Vector { .. } => {
+                    // every VGPR the instruction reads: v_swap_b32 reads the destination too
                     let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(_))).map(|r| r.1).collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
