@@ -10,7 +10,6 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -30,9 +29,6 @@ use windows_sys::Win32::System::ProcessStatus::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
-
-use victory_gpu::framelog::T;
-use victory_gpu::resource::PageMap;
 
 use crate::{HleModule, hle_export};
 
@@ -670,30 +666,14 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
 }
 
-/// `VICTORY_REMAP_FAST=1`: a mapping call that would change nothing (the
-/// range already shows those pages, or is already empty) returns at once,
-/// without the exclusive mapping lock (`victory_gpu::title_memory_remapping`)
-/// and without telling the GPU side of a remapping; a batch (scatter, the
-/// GPU's page-mapping copies) takes that lock once, unmaps each destination
-/// once, and maps neighbouring pages of one section as one view. The frame
-/// log counts what it skipped and merged. Off by default, for A/B runs: a
-/// skipped call leaves the GPU side's guards and protections there as they
-/// were, where a remapping resets them, and larger views make a later
-/// partial unmap rebuild more.
+/// `VICTORY_REMAP_FAST=1`: a mapping call that would leave a range showing
+/// the pages it shows (or empty) skips the unmapping and mapping again and
+/// only resets what those would ([`refresh`]); the frame log counts them.
+/// Off by default, for A/B runs.
 fn remap_fast() -> bool {
     static FAST: LazyLock<bool> =
         LazyLock::new(|| std::env::var("VICTORY_REMAP_FAST").is_ok_and(|v| v.trim() == "1"));
     *FAST
-}
-
-/// The exclusive mapping lock of one call, once its first real change
-/// takes it.
-type Changing = Option<victory_gpu::Remapping>;
-
-fn count(t: T, n: usize) {
-    if n > 0 {
-        victory_gpu::framelog::add(t, n as u64);
-    }
 }
 
 /// The slice the page at `at` shows, if a view holds it.
@@ -717,6 +697,71 @@ fn shows(views: &BTreeMap<usize, (usize, Slice)>, base: usize, wanted: &[Option<
         .all(|(k, w)| slice_at(views, base + k * PAGE).map(|s| s.key(0)) == *w)
 }
 
+/// [`XMemMapPhysicalPages`] with `VICTORY_REMAP_FAST`: if `[base, ..)`
+/// already shows `pages` (or is empty, null `pages`), [`refresh`] it and
+/// say so.
+fn same_pages(physical: &Physical, base: usize, n: usize, pages: *const usize) -> bool {
+    let wanted: Option<Vec<_>> = if pages.is_null() {
+        Some(vec![None; n])
+    } else {
+        // SAFETY: the title passes `n` page numbers.
+        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+        pages.iter().map(|p| physical.pages.get(p).map(|s| Some(s.key(0)))).collect()
+    };
+    let same = wanted.is_some_and(|w| shows(&physical.views, base, &w));
+    if same {
+        refresh(physical, base, n * PAGE);
+    }
+    same
+}
+
+/// [`map_alias`] with `VICTORY_REMAP_FAST`: if `to` already shows what it
+/// would (or is empty, `from` 0), [`refresh`] it and say so. A source
+/// overlapping `to` is lost to the unmapping: never the same.
+fn same_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    if from != 0 && from < to + len && to < from + len {
+        return false;
+    }
+    let wanted: Option<Vec<_>> = (0..len)
+        .step_by(PAGE)
+        .map(|k| match from {
+            0 => Some(None),
+            _ => slice_at(&physical.views, from + k).map(|s| Some(s.key(0))),
+        })
+        .collect();
+    let same = wanted.is_some_and(|w| shows(&physical.views, to, &w));
+    if same {
+        refresh(physical, to, len);
+    }
+    same
+}
+
+/// A remapping of `[base, base + len)` to what it shows already: no
+/// unmapping and no mapping again, but what the title or the GPU side would
+/// see those reset is reset, over every view they would take away and map
+/// again whole: read-write again, and the GPU side told it is remapped
+/// (guards, texture copy-backs, descriptors) and what it shows. Nothing
+/// mapped there: nothing to reset, no lock.
+fn refresh(physical: &Physical, base: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    victory_gpu::framelog::add(victory_gpu::framelog::T::RemapSkips, 1);
+    let hit = views_in(physical, base, len);
+    if hit.is_empty() {
+        return;
+    }
+    // As for a remapping: the GPU side's guards change with no read in
+    // place under way.
+    let _changing = victory_gpu::title_memory_remapping();
+    for at in hit {
+        let (size, slice) = &physical.views[&at];
+        let mut old = 0;
+        // SAFETY: a committed view of ours.
+        unsafe { VirtualProtect(at as *const c_void, *size, PAGE_READWRITE, &mut old) };
+        victory_gpu::title_memory_remapped(at, *size);
+        victory_gpu::title_memory_view(at, *size, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -724,53 +769,27 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let base = address as usize;
     let mut physical = physical();
-    let mut changing = None;
-    // SAFETY: the title passes `n` page numbers.
-    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
-    if map_pages(&mut physical, &mut changing, address as usize, n, pages, remap_fast()) {
-        address
-    } else {
-        std::ptr::null_mut()
-    }
-}
-
-/// [`XMemMapPhysicalPages`] under the page table's lock.
-fn map_pages(
-    physical: &mut Physical,
-    changing: &mut Changing,
-    base: usize,
-    n: usize,
-    pages: Option<&[usize]>,
-    fast: bool,
-) -> bool {
-    if fast {
-        let wanted: Option<Vec<_>> = match pages {
-            None => Some(vec![None; n]),
-            Some(pages) => pages
-                .iter()
-                .map(|p| physical.pages.get(p).map(|s| Some(s.key(0))))
-                .collect(),
-        };
-        if wanted.is_some_and(|w| shows(&physical.views, base, &w)) {
-            count(T::RemapSkips, 1);
-            return true;
-        }
+    if remap_fast() && same_pages(&physical, base, n, pages) {
+        return address;
     }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    changing.get_or_insert_with(victory_gpu::title_memory_remapping);
-    unmap(physical, base, n * PAGE);
-    let Some(pages) = pages else {
-        return true;
-    };
+    let _changing = victory_gpu::title_memory_remapping();
+    unmap(&mut physical, base, n * PAGE);
+    if pages.is_null() {
+        return address;
+    }
+    // SAFETY: the title passes `n` page numbers.
+    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return false;
+            return std::ptr::null_mut();
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -782,12 +801,12 @@ fn map_pages(
                 })
             })
             .count();
-        if !map(physical, base + i * PAGE, run * PAGE, first) {
-            return false;
+        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            return std::ptr::null_mut();
         }
         i += run;
     }
-    true
+    address
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -800,55 +819,23 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    let entries: Vec<(usize, usize)> = (0..n)
+    for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        .map(|i| unsafe {
+        let (address, page) = unsafe {
             (
-                *addresses.add(i) as usize,
-                if pages.is_null() { 0 } else { *pages.add(i) },
+                *addresses.add(i),
+                if pages.is_null() || *pages.add(i) == 0 {
+                    std::ptr::null()
+                } else {
+                    pages.add(i)
+                },
             )
-        })
-        .collect();
-    scatter(&entries, remap_fast()).into()
-}
-
-fn scatter(entries: &[(usize, usize)], fast: bool) -> bool {
-    if !fast {
-        return entries.iter().all(|&(address, page)| {
-            let page = if page == 0 { std::ptr::null() } else { &raw const page };
-            !XMemMapPhysicalPages(address as *mut c_void, 1, page).is_null()
-        });
-    }
-    let mut physical = physical();
-    let mut changing = None;
-    let runs = scatter_runs(entries, |page| physical.pages.contains_key(&page));
-    runs.into_iter().all(|run| {
-        let entries = &entries[run];
-        count(T::RemapMerged, entries.len() - 1);
-        let pages: Vec<usize> = entries.iter().map(|e| e.1).collect();
-        let pages = (pages[0] != 0).then_some(pages.as_slice());
-        map_pages(&mut physical, &mut changing, entries[0].0, entries.len(), pages, true)
-    })
-}
-
-/// Scatter entries (address, page; 0 unmaps) as runs to map in one call
-/// each: consecutive entries at consecutive addresses, all unmapping or all
-/// of known pages. An unknown page stays alone, so that the call fails
-/// where it did, the entries before it done and those after untouched.
-fn scatter_runs(entries: &[(usize, usize)], known: impl Fn(usize) -> bool) -> Vec<Range<usize>> {
-    let mut runs: Vec<Range<usize>> = Vec::new();
-    for (i, &(address, page)) in entries.iter().enumerate() {
-        let joins = |&(a, p): &(usize, usize)| {
-            a.checked_add(PAGE) == Some(address)
-                && (p == 0) == (page == 0)
-                && (page == 0 || known(page) && known(p))
         };
-        match runs.last_mut() {
-            Some(run) if joins(&entries[i - 1]) => run.end = i + 1,
-            _ => runs.push(i..i + 1),
+        if XMemMapPhysicalPages(address, 1, page).is_null() {
+            return 0;
         }
     }
-    runs
+    1
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -857,14 +844,14 @@ fn scatter_runs(entries: &[(usize, usize)], known: impl Fn(usize) -> bool) -> Ve
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    if remap_fast() && same_alias(&physical, to, from, len) {
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
-    alias_pages(&mut physical, to as usize, from as usize, len as usize)
-}
-
-fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
-    unmap(physical, to, len);
+    unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -872,103 +859,11 @@ fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> b
         let Some(slice) = slice_at(&physical.views, from + k) else {
             return false;
         };
-        if !map(physical, to + k, PAGE, slice) {
+        if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
     }
     true
-}
-
-/// A batch of the GPU's page-mapping copies, in order ([`map_alias`]; a
-/// repeated source one page at a time, stopping at the first failure).
-pub fn map_aliases(maps: &[PageMap]) -> bool {
-    aliases(maps, remap_fast())
-}
-
-fn aliases(maps: &[PageMap], fast: bool) -> bool {
-    let mut ok = true;
-    if !fast {
-        let page = PAGE as u64;
-        for m in maps {
-            ok &= if m.repeat {
-                (0..m.len / page).all(|k| map_alias(m.to + k * page, m.from, page))
-            } else {
-                map_alias(m.to, m.from, m.len)
-            };
-        }
-        return ok;
-    }
-    let mut physical = physical();
-    let mut changing = None;
-    let mut i = 0;
-    while i < maps.len() {
-        let mut m = maps[i];
-        // Unmaps of neighbouring ranges: one.
-        while m.from == 0 && maps.get(i + 1).is_some_and(|n| n.from == 0 && n.to == m.to + m.len) {
-            i += 1;
-            m.len += maps[i].len;
-            count(T::RemapMerged, 1);
-        }
-        ok &= alias(&mut physical, &mut changing, m);
-        i += 1;
-    }
-    ok
-}
-
-/// One page-mapping copy with `VICTORY_REMAP_FAST`: as [`aliases`] without
-/// it, but nothing changes if `to` already shows what it would, and
-/// neighbouring source pages of one section become one view.
-fn alias(physical: &mut Physical, changing: &mut Changing, m: PageMap) -> bool {
-    let (to, from, len) = (m.to as usize, m.from as usize, m.len as usize);
-    let n = len.div_ceil(PAGE);
-    // A source inside the destination changes under the loop: page by
-    // page, as without the switch.
-    let source_len = if m.repeat { PAGE } else { len };
-    if from != 0 && from < to + len && to < from + source_len {
-        changing.get_or_insert_with(victory_gpu::title_memory_remapping);
-        return if m.repeat {
-            (0..n).all(|k| alias_pages(physical, to + k * PAGE, from, PAGE))
-        } else {
-            alias_pages(physical, to, from, len)
-        };
-    }
-    // What each destination page is to show: the source pages up to the
-    // first one not mapped.
-    let sources: Vec<Slice> = if from == 0 {
-        Vec::new()
-    } else if m.repeat {
-        slice_at(&physical.views, from).map(|s| vec![s; n]).unwrap_or_default()
-    } else {
-        (0..n).map_while(|k| slice_at(&physical.views, from + k * PAGE)).collect()
-    };
-    let complete = from == 0 || sources.len() == n;
-    if complete {
-        let wanted: Vec<_> = (0..n).map(|k| sources.get(k).map(|s| s.key(0))).collect();
-        if shows(&physical.views, to, &wanted) {
-            count(T::RemapSkips, 1);
-            return true;
-        }
-    }
-    changing.get_or_insert_with(victory_gpu::title_memory_remapping);
-    // A repeated source that is not mapped fails at the first page, the
-    // others untouched.
-    unmap(physical, to, if m.repeat && !complete { PAGE } else { len });
-    // One view per run of consecutive slices of one section.
-    let mut k = 0;
-    while k < sources.len() {
-        let first = &sources[k];
-        let run = 1 + sources[k + 1..]
-            .iter()
-            .zip(1..)
-            .take_while(|(s, j)| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + j)
-            .count();
-        count(T::RemapMerged, run - 1);
-        if !map(physical, to + k * PAGE, run * PAGE, first.clone()) {
-            return false;
-        }
-        k += run;
-    }
-    complete
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1068,6 +963,25 @@ fn commit_limit_message(
     message
 }
 
+/// The views that overlap `[base, base + len)`, by address.
+fn views_in(physical: &Physical, base: usize, len: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    // Views do not overlap: the one holding `base`, then those starting
+    // inside (the GPU's page mappings make one view per page).
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .map(|(at, _)| *at);
+    first
+        .into_iter()
+        .chain(physical.views.range(base + 1..base + len).map(|(at, _)| *at))
+        .collect()
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -1078,19 +992,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
-    // Views do not overlap: the one holding `base`, then those starting
-    // inside (the GPU's page mappings make one view per page).
-    let first = physical
-        .views
-        .range(..=base)
-        .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
-        .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
-    for at in hit {
+    for at in views_in(physical, base, len) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
@@ -1520,118 +1422,95 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
+    /// One reservation of `n` 64 KiB pages for mapping.
+    fn reserve(n: usize) -> usize {
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        at as usize
+    }
+
+    /// Scatter reads each entry after doing the ones before it: an entry
+    /// that maps over the page holding the list changes those after it.
     #[test]
-    fn no_op_detection_compares_page_for_page() {
+    fn scatter_reads_each_entry_after_the_ones_before() {
         let pages = allocate(3);
-        let slice = |i: usize| physical().pages.get(&pages[i]).cloned().expect("known page");
-        let key = |i: usize| Some(slice(i).key(0));
-        // Pages 1 and 2 at page addresses 4 and 5; nothing is mapped.
-        let views = BTreeMap::from([(4 * PAGE, (2 * PAGE, slice(1)))]);
-        assert!(shows(&views, 4 * PAGE, &[key(1), key(2)]));
-        assert!(shows(&views, 5 * PAGE, &[key(2), None]), "inside a view, then a hole");
-        assert!(shows(&views, 0, &[None; 4]), "already empty");
-        assert!(shows(&views, 4 * PAGE, &[]));
-        assert!(!shows(&views, 4 * PAGE, &[key(2), key(1)]), "other pages");
-        assert!(!shows(&views, 3 * PAGE, &[None, None]), "a page still mapped");
-        assert!(!shows(&views, 6 * PAGE, &[key(0)]), "a hole that is to show a page");
+        let (a, b, c, d) = (reserve(1), reserve(1), reserve(1), reserve(1));
+        // The addresses as they are at `a` (page 0), and as page 1 has them.
+        // (Not the page numbers: their entry's own is read again after its
+        // unmapping.)
+        let list = |at: usize, second: usize| {
+            // SAFETY: `at` is mapped read-write; 2 words.
+            unsafe {
+                let words = at as *mut usize;
+                *words = a;
+                *words.add(1) = second;
+            }
+        };
+        assert_eq!(XMemMapPhysicalPages(b as *mut c_void, 1, &pages[1]), b as *mut c_void);
+        list(b, d);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, &pages[0]), a as *mut c_void);
+        list(a, c);
+        // The first entry maps page 1 at `a`: the second is then `d`.
+        let numbers = [pages[1], pages[2]];
+        assert_eq!(XMemMapPhysicalPagesScatter(a as *const *mut c_void, 2, numbers.as_ptr()), 1);
+        assert_eq!(query(c as *const c_void).host.State, MEM_RESERVE);
+        assert_eq!(query(d as *const c_void).host.State, MEM_COMMIT);
+        for at in [a, b, d] {
+            XMemMapPhysicalPages(at as *mut c_void, 1, std::ptr::null());
+        }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// A null address fails its scatter entry, and the entries after it
+    /// are not done.
     #[test]
-    fn scatter_entries_merge_into_runs() {
-        let known = |page: usize| page != 99;
-        let p = PAGE;
-        let entries = [
-            (p, 1),
-            (2 * p, 5),
-            (3 * p, 2),
-            (4 * p, 0),
-            (5 * p, 0),
-            (7 * p, 0),
-            (8 * p, 3),
-            (9 * p, 99),
-            (10 * p, 4),
-            (11 * p, 6),
-            (11 * p, 7),
-        ];
-        // Consecutive addresses, all mapping known pages or all unmapping;
-        // an unknown page alone; the same address again starts a run.
-        assert_eq!(
-            scatter_runs(&entries, known),
-            vec![0..3, 3..5, 5..6, 6..7, 7..8, 8..10, 10..11]
-        );
-        assert!(scatter_runs(&[], known).is_empty());
+    fn scatter_stops_at_a_null_address() {
+        let pages = allocate(1);
+        let b = reserve(1);
+        let addresses = [std::ptr::null_mut(), b as *mut c_void];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, [0, pages[0]].as_ptr()), 0);
+        assert_eq!(query(b as *const c_void).host.State, MEM_RESERVE);
+        // `VICTORY_REMAP_FAST` finds the null page empty, and the call
+        // still returns its (null) address.
+        assert!(same_pages(&physical(), 0, 1, std::ptr::null()));
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
-    /// `VICTORY_REMAP_FAST`'s paths: batches make one view of neighbouring
-    /// pages, calls that change nothing leave the views alone, and failures
-    /// leave what they did without the switch.
+    /// `VICTORY_REMAP_FAST`: a remapping to the pages shown already maps
+    /// nothing, but leaves its views read-write as a remapping would (and
+    /// tells the GPU side, `victory_gpu::title_memory_remapped`).
     #[test]
-    fn fast_remaps_merge_batches_and_skip_no_ops() {
+    fn same_page_remaps_reset_protection() {
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         let pages = allocate(3);
-        let reserve = |n: usize| {
-            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
-            assert!(!at.is_null());
-            at as usize
-        };
-        let (a, b) = (reserve(3), reserve(4));
-        let state = |at: usize| query(at as *const c_void).host;
-        // A remapping makes a new read-write view; a skipped one leaves
-        // this protection.
-        let mark = |at: usize| {
+        let (a, b) = (reserve(2), reserve(1));
+        let protect = |at: usize| query(at as *const c_void).host.Protect;
+        let read_only = |at: usize, n: usize| {
             let mut old = 0;
-            // SAFETY: a page of a view of ours.
-            assert_ne!(unsafe { VirtualProtect(at as *const c_void, PAGE, PAGE_READONLY, &mut old) }, 0);
+            // SAFETY: pages of a view of ours.
+            assert_ne!(unsafe { VirtualProtect(at as *const c_void, n * PAGE, PAGE_READONLY, &mut old) }, 0);
         };
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, pages.as_ptr()), a as *mut c_void);
+        assert!(map_alias(b as u64, (a + PAGE) as u64, PAGE as u64));
 
-        let entries: Vec<_> = (0..3).map(|i| (a + i * PAGE, pages[i])).collect();
-        assert!(scatter(&entries, true));
-        assert_eq!(physical().views.get(&a).map(|v| v.0), Some(3 * PAGE), "one view");
-        // SAFETY: mapped read-write.
-        unsafe {
-            (a as *mut u8).write(1);
-            ((a + 2 * PAGE) as *mut u8).write(3);
-        }
-        mark(a);
-        assert!(scatter(&entries, true));
-        assert_eq!(state(a).Protect, PAGE_READONLY, "the same pages: untouched");
+        read_only(a, 2);
+        assert!(!same_pages(&physical(), a + PAGE, 1, &pages[2]), "other pages");
+        assert_eq!(protect(a + PAGE), PAGE_READONLY);
+        assert!(same_pages(&physical(), a + PAGE, 1, &pages[1]));
+        // The whole view, as a remapping maps its rest again.
+        assert_eq!((protect(a), protect(a + PAGE)), (PAGE_READWRITE, PAGE_READWRITE));
+        assert_eq!(physical().views.get(&a).map(|v| v.0), Some(2 * PAGE), "the view stays");
 
-        let page = PAGE as u64;
-        let maps = [
-            PageMap { to: b as u64, from: a as u64, len: 2 * page, repeat: false },
-            PageMap { to: b as u64 + 2 * page, from: a as u64 + 2 * page, len: 2 * page, repeat: true },
-        ];
-        assert!(aliases(&maps, true));
-        assert_eq!(physical().views.get(&b).map(|v| v.0), Some(2 * PAGE), "one view");
-        // SAFETY: mapped (the first page read-only).
-        unsafe {
-            assert_eq!((b as *const u8).read(), 1);
-            assert_eq!(((b + 3 * PAGE) as *const u8).read(), 3);
-        }
-        mark(b + 3 * PAGE);
-        assert!(aliases(&maps, true));
-        assert_eq!(state(b + 3 * PAGE).Protect, PAGE_READONLY, "untouched");
+        read_only(b, 1);
+        assert!(!same_alias(&physical(), a, a + PAGE, 2 * PAGE), "a source in the destination");
+        assert!(same_alias(&physical(), b, a + PAGE, PAGE));
+        assert_eq!(protect(b), PAGE_READWRITE);
 
-        // Neighbouring unmaps, then again on empty pages.
-        let unmaps = [
-            PageMap { to: b as u64, from: 0, len: 2 * page, repeat: false },
-            PageMap { to: b as u64 + 2 * page, from: 0, len: 2 * page, repeat: false },
-        ];
-        for _ in 0..2 {
-            assert!(aliases(&unmaps, true));
-            assert!(scatter(&[(b, 0), (b + PAGE, 0)], true));
-            for k in 0..4 {
-                assert_eq!(state(b + k * PAGE).State, MEM_RESERVE);
-            }
-        }
-
-        // A repeated source not mapped: its first page goes, the rest stays.
-        let failing = PageMap { to: a as u64, from: b as u64, len: 2 * page, repeat: true };
-        assert!(!aliases(&[failing], true));
-        assert_eq!(state(a).State, MEM_RESERVE);
-        assert_eq!(state(a + PAGE).State, MEM_COMMIT);
-        assert_eq!(XMemMapPhysicalPages((a + PAGE) as *mut c_void, 2, std::ptr::null()), (a + PAGE) as *mut c_void);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, std::ptr::null()), a as *mut c_void);
+        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert!(same_pages(&physical(), a, 2, std::ptr::null()), "already empty");
+        assert!(same_alias(&physical(), b, 0, PAGE));
+        assert_eq!(query(a as *const c_void).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 

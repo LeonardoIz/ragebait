@@ -271,4 +271,15 @@ mod tests {
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
     }
+
+    /// The runtime's remapping notice, also sent for a remapping to the
+    /// same pages (`victory-hle` `xmem`, `VICTORY_REMAP_FAST`), ends the
+    /// copy-backs there.
+    #[cfg(windows)]
+    #[test]
+    fn a_remapping_notice_invalidates_copy_backs() {
+        let ticket = track(95, 0x7_0000, 0x8_0000);
+        crate::title_memory_remapped(0x7_8000, 0x1000);
+        assert!(!ticket.valid.load(Ordering::Acquire));
+    }
 }
