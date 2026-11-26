@@ -589,7 +589,7 @@ pub(crate) struct State {
     /// The number of this recording of the list, by which the views its
     /// tables hold are made once (`crate::descriptor::host::list_views`)
     /// and, in diagnostics builds, the tables it makes twice are told
-    /// ([`table_asked`]); 0 until its first fresh table.
+    /// ([`table_asked`]); 0 until its first fresh table that needs it.
     recording: u64,
 }
 
@@ -1315,6 +1315,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        // Without the cache the views are made and pushed straight away.
+        let cache = bind_cache();
+        let mut rtvs = Vec::new();
         let mut views = Vec::new();
         let mut keys: Vec<TargetKey> = Vec::new();
         for &h in handles {
@@ -1336,16 +1339,24 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    keys.push((0, record.key()));
-                    views.push((None, Some(desc)));
+                    if cache {
+                        keys.push((0, record.key()));
+                        views.push((None, Some(desc)));
+                    } else {
+                        rtvs.push(host.rtv(None, Some(&desc)));
+                    }
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            keys.push((texture.as_raw() as usize, record.key()));
-            views.push((Some(texture), record.desc()));
+            if cache {
+                keys.push((texture.as_raw() as usize, record.key()));
+                views.push((Some(texture), record.desc()));
+            } else {
+                rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            }
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -1360,15 +1371,15 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
-        if bind_cache() {
+        if cache {
             let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
             if self.host_targets.as_ref() == Some(&now) {
                 crate::framelog::add(crate::framelog::T::TargetsAgain, 1);
                 return;
             }
             self.host_targets = Some(now);
+            rtvs = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         }
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -3906,10 +3917,13 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
-            if self.recording == 0 {
-                self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
-            }
-            let listed = crate::descriptor::host::list_views().then_some(self.recording);
+            // Numbered only where used: diagnostics number it in `table_asked`.
+            let listed = crate::descriptor::host::list_views().then(|| {
+                if self.recording == 0 {
+                    self.recording = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
+                }
+                self.recording
+            });
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
