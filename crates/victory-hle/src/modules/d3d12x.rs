@@ -62,6 +62,9 @@ pub fn prebuild_pipelines(threads: usize) -> Result<String, String> {
     }
 }
 
+#[cfg(windows)]
+pub use victory_gpu::pipeline::finish_pipeline_recording;
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

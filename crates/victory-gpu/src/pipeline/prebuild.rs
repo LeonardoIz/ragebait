@@ -29,7 +29,9 @@ use std::ffi::{CStr, CString};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use super::host::{GraphicsState, HostPipeline};
 use super::{Bytecode, Shader};
@@ -60,15 +62,9 @@ const STAGES: [&str; 8] = [
     "mesh",
 ];
 
-/// Whether title pipelines are recorded for `victory prebuild`. Off by
-/// default (it writes the title's shader containers into the cache
-/// folder); `VICTORY_PSO_PREBUILD=1` records. Only while this process
-/// holds the cache folder (`library::dir`): else nothing would save the
-/// queue, which would keep every recorded shader container alive.
+/// Whether title pipelines are recorded for `victory prebuild`.
 pub(crate) fn recording() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_PREBUILD").is_some_and(|v| v == "1"));
-    on && super::library::dir().is_some()
+    WRITER.get().is_some()
 }
 
 /// An input element: its semantic name and the 24 bytes after the name.
@@ -350,35 +346,100 @@ fn load(dir: &Path) -> HashSet<String> {
     all.into_iter().map(|d| d.key).collect()
 }
 
-/// Descriptions of pipelines first used since the last save, with their
-/// shaders (whose containers are written beside them).
 type Queued = (Description, Vec<Arc<Shader>>);
-static QUEUE: Mutex<Vec<Queued>> = Mutex::new(Vec::new());
+static RECORDER: Recorder = Recorder::new();
+static WRITER: OnceLock<Mutex<Option<Writer>>> = OnceLock::new();
 
-/// A draw or dispatch first used the title pipeline `key`: its description
-/// goes out with the next save (`library::save`).
-pub(crate) fn note(key: &str, shaders: &[Arc<Shader>], record: Option<&Portable>) {
-    let Some(portable) = record else { return };
-    let d = Description {
-        key: key.to_owned(),
-        shaders: shaders
-            .iter()
-            .map(|s| (s.stage.to_owned(), s.hash.clone()))
-            .collect(),
-        portable: portable.clone(),
-    };
-    QUEUE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((d, shaders.to_vec()));
+struct Writer {
+    stop: Sender<()>,
+    drained: Receiver<()>,
 }
 
-/// Appends the queued descriptions that `dir` does not hold yet; on a
-/// worker, with the library's save.
-pub(crate) fn flush(dir: &Path) {
-    let queued = std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
-    if !queued.is_empty() {
-        append(dir, queued, settings());
+struct Recorder {
+    /// First uses since the last flush, or `None` after the final drain.
+    queue: Mutex<Option<Vec<Queued>>>,
+}
+
+impl Recorder {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(Some(Vec::new())),
+        }
+    }
+
+    fn note(&self, key: &str, shaders: &[Arc<Shader>], portable: &Portable) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = queue.as_mut().filter(|queue| queue.len() < MAX) else {
+            return;
+        };
+        let d = Description {
+            key: key.to_owned(),
+            shaders: shaders
+                .iter()
+                .map(|s| (s.stage.to_owned(), s.hash.clone()))
+                .collect(),
+            portable: portable.clone(),
+        };
+        queue.push((d, shaders.to_vec()));
+    }
+
+    fn flush(&self, dir: &Path, end: bool) {
+        let queued = {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if end {
+                queue.take()
+            } else {
+                queue.as_mut().map(std::mem::take)
+            }
+        };
+        if let Some(queued) = queued.filter(|queue| !queue.is_empty()) {
+            append(dir, queued, settings());
+        }
+    }
+}
+
+/// Queues the description on first use without doing file I/O.
+pub(crate) fn note(key: &str, shaders: &[Arc<Shader>], record: Option<&Portable>) {
+    if let Some(portable) = record {
+        RECORDER.note(key, shaders, portable);
+    }
+}
+
+/// Starts the writer once the process holds the cache folder.
+pub(crate) fn start(dir: &'static Path) {
+    // VICTORY_PSO_PREBUILD=1 records descriptions and shader containers.
+    if std::env::var_os("VICTORY_PSO_PREBUILD").is_none_or(|v| v != "1") {
+        return;
+    }
+    let (stop, wake) = mpsc::channel();
+    let (done, drained) = mpsc::channel();
+    match std::thread::Builder::new()
+        .name("victory-pipeline-descriptions".into())
+        .spawn(move || {
+            while matches!(wake.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Timeout)) {
+                RECORDER.flush(dir, false);
+            }
+            RECORDER.flush(dir, true);
+            let _ = done.send(());
+        })
+    {
+        Ok(_) => {
+            let _ = WRITER.set(Mutex::new(Some(Writer { stop, drained })));
+        }
+        Err(e) => tracing::warn!(error = %e, "could not start the pipeline description writer"),
+    }
+}
+
+pub(crate) fn finish() {
+    if let Some(writer) = WRITER.get() {
+        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Writer { stop, drained }) = writer.take() {
+            drop(stop);
+            // The writer acknowledges before Windows delivers its thread-detach notices.
+            if drained.recv().is_err() {
+                tracing::warn!("pipeline description writer stopped before draining");
+            }
+        }
     }
 }
 
@@ -388,11 +449,11 @@ pub(crate) fn flush(dir: &Path) {
 fn append(dir: &Path, queued: Vec<Queued>, now: [u8; 8]) {
     static KNOWN: Mutex<Option<(PathBuf, HashSet<String>)>> = Mutex::new(None);
     static FULL: std::sync::Once = std::sync::Once::new();
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if known.as_ref().is_none_or(|(d, _)| d != dir) {
-        *known = Some((dir.to_owned(), load(dir)));
+    let mut cache = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.as_ref().is_none_or(|(d, _)| d != dir) {
+        *cache = Some((dir.to_owned(), load(dir)));
     }
-    let known = &mut known.as_mut().expect("just set").1;
+    let known = &mut cache.as_mut().expect("just set").1;
     let (mut out, mut keys) = (Vec::new(), HashSet::new());
     for (d, shaders) in queued {
         if known.len() + keys.len() >= MAX {
@@ -440,7 +501,11 @@ fn append(dir: &Path, queued: Vec<Queued>, now: [u8; 8]) {
     })();
     match written {
         Ok(()) => known.extend(keys),
-        Err(e) => tracing::warn!(error = %e, "pipeline descriptions not recorded"),
+        Err(e) => {
+            // Reload the keys and cut off any partial write before appending again.
+            *cache = None;
+            tracing::warn!(error = %e, "pipeline descriptions not recorded");
+        }
     }
 }
 
@@ -594,6 +659,28 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_queue_is_bounded_and_drains_without_a_host_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        let portable = Portable::default();
+        for _ in 0..MAX {
+            recorder.note("first", &[], &portable);
+        }
+        recorder.note("overflow", &[], &portable);
+        assert_eq!(recorder.queue.lock().unwrap().as_ref().unwrap().len(), MAX);
+
+        recorder.flush(dir.path(), false);
+        assert_eq!(read_all(dir.path()).0[0].key, "first");
+        recorder.note("last", &[], &portable);
+        recorder.flush(dir.path(), true);
+        recorder.note("after exit", &[], &portable);
+        recorder.flush(dir.path(), false);
+
+        let keys: Vec<_> = read_all(dir.path()).0.into_iter().map(|d| d.key).collect();
+        assert_eq!(keys, ["first", "last"]);
+    }
 
     /// A title's stream: vertex and pixel shaders, an input layout, a
     /// topology and a rasterizer (cull mode `cull`).

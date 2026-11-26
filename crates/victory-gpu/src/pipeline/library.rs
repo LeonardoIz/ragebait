@@ -66,7 +66,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
         tracing::warn!(error = %e, "the pipeline cache folder is in use by another victory process (a run or `victory prebuild`): no pipeline library in this one");
         return;
     }
-    let _ = DIR.set(dir);
+    if DIR.set(dir).is_ok() {
+        super::prebuild::start(self::dir().expect("just set"));
+    }
 }
 
 /// Held, opened without sharing, for as long as a process uses the
@@ -667,7 +669,6 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    super::prebuild::flush(dir);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
