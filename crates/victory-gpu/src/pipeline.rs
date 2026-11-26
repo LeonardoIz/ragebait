@@ -111,17 +111,25 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-                #[cfg(windows)]
-                walks: OnceLock::new(),
-            })
+            Arc::new(Shader::new(stage, bytes, &full))
         })
         .clone()
+}
+
+impl Shader {
+    /// A container of its own (not in the shared table); `full` is the
+    /// blake3 hash of `bytes`.
+    fn new(stage: &'static str, bytes: &[u8], full: &blake3::Hash) -> Shader {
+        Shader {
+            stage,
+            hash: full.to_hex()[..16].to_owned(),
+            container: bytes.to_vec(),
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+            #[cfg(windows)]
+            walks: OnceLock::new(),
+        }
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -584,12 +592,17 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] record: Option<prebuild::Portable>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let mut p = make::Pending::new(shaders.clone(), graphics);
+        p.record = record;
+        Arc::new(p)
+    };
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -631,6 +644,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        prebuild::recording().then(prebuild::Portable::default),
         iid,
         out,
     )
@@ -651,6 +666,8 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        prebuild::recording().then(prebuild::Portable::default),
         iid,
         out,
     )
@@ -722,36 +739,17 @@ pub(crate) extern "system" fn create_stream(
     if desc.stream.is_null() {
         return E_INVALIDARG;
     }
-    let mut shaders = Vec::new();
+    // SAFETY: the title passes `size` bytes of stream.
+    let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
-    let mut at = 0;
-    while at + 8 <= desc.size {
-        // SAFETY: inside the stream the title passes.
-        let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
-        let Some((size, stage)) = subobject(kind) else {
-            tracing::warn!(
-                kind,
-                at,
-                "pipeline subobject of unknown size; the rest is ignored"
-            );
-            break;
-        };
-        if size > desc.size - at {
-            break;
-        }
-        if let Some(stage) = stage {
-            // SAFETY: the whole bytecode is in the stream, which can be unaligned.
-            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
-            shaders.extend(copy(stage, &code));
-        }
+    let shaders = read_stream(stream, copy, |_kind, _at| {
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
-            graphics.read(kind, desc.stream.add(at))
+            graphics.read(_kind, _at)
         };
-        at += size;
-    }
+    });
     // The whole state is read: integer targets do not blend on the host
     // (`GraphicsState::integer_targets_do_not_blend`).
     #[cfg(windows)]
@@ -763,13 +761,52 @@ pub(crate) extern "system" fn create_stream(
             );
         });
     }
+    // SAFETY: the stream's pointers are the title's, live during creation.
+    #[cfg(windows)]
+    let record = prebuild::recording().then(|| unsafe { prebuild::portable(stream) });
     hand_out(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(windows)]
+        record,
         iid,
         out,
     )
+}
+
+/// A stream's shaders, each made by `shader` from its stage and bytecode;
+/// `state` sees every whole subobject (its type and where it lies). The
+/// stream's pointers must be live: the title's, or a pre-build's.
+fn read_stream(
+    stream: &[u8],
+    shader: impl Fn(&'static str, &Bytecode) -> Option<Arc<Shader>>,
+    mut state: impl FnMut(u32, *const u8),
+) -> Vec<Arc<Shader>> {
+    let mut shaders = Vec::new();
+    let mut at = 0;
+    while at + 8 <= stream.len() {
+        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+        let Some((size, stage)) = subobject(kind) else {
+            tracing::warn!(
+                kind,
+                at,
+                "pipeline subobject of unknown size; the rest is ignored"
+            );
+            break;
+        };
+        if size > stream.len() - at {
+            break;
+        }
+        if let Some(stage) = stage {
+            // SAFETY: the whole bytecode is in the stream, which can be unaligned.
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(shader(stage, &code));
+        }
+        state(kind, stream[at..].as_ptr());
+        at += size;
+    }
+    shaders
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -803,6 +840,16 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod prebuild;
+
+/// The offline pipeline pre-build (`victory prebuild`, see `prebuild`):
+/// every recorded title pipeline made into the pipeline library; its
+/// summary line.
+#[cfg(windows)]
+pub fn prebuild_pipelines(threads: usize) -> Result<String, String> {
+    prebuild::run(threads)
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

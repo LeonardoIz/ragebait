@@ -57,9 +57,52 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on,
+/// unless another process holds the folder (`IN_USE`); this one then goes
+/// without the library.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    if let Err(e) = hold(&dir) {
+        BUSY.store(true, Ordering::Relaxed);
+        tracing::warn!(error = %e, "the pipeline cache folder is in use by another victory process (a run or `victory prebuild`): no pipeline library in this one");
+        return;
+    }
     let _ = DIR.set(dir);
+}
+
+/// Held, opened without sharing, for as long as a process uses the
+/// folder: one run or `victory prebuild` at a time, since both write the
+/// library through the same `.tmp` file. Windows lets go of it when the
+/// process ends, however it ends.
+const IN_USE: &str = "in-use.lock";
+static HELD: OnceLock<std::fs::File> = OnceLock::new();
+/// Whether `use_pipeline_cache` found the folder held by another process.
+pub(crate) static BUSY: AtomicBool = AtomicBool::new(false);
+
+fn hold(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    if HELD.get().is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(dir.join(IN_USE))?;
+    let _ = HELD.set(file);
+    Ok(())
+}
+
+/// The folder `use_pipeline_cache` gave, if any.
+pub(crate) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
+thread_local! {
+    /// Whether this thread's last pipeline came from the library (else it
+    /// was compiled), for the pre-build's counts.
+    pub(crate) static LOADED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -547,6 +590,7 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    LOADED_HERE.set(false);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -564,6 +608,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            LOADED_HERE.set(true);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -613,6 +658,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    super::prebuild::flush(dir);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
