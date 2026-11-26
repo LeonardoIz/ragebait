@@ -99,13 +99,19 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     if event.is_null() {
         // A null event means "block until reached" (`VICTORY_FENCE_WAIT`):
         // an event of ours waits with the title's, registered under the
-        // lock the value was read under.
+        // lock the value was read under, and the 250 ms count from here.
         #[cfg(windows)]
-        let blocking = fence_wait().then(|| latch(&mut waiters, value)).flatten();
+        let blocking = fence_wait()
+            .then(|| latch(&mut waiters, value))
+            .flatten()
+            .map(|latch| (latch, std::time::Instant::now() + std::time::Duration::from_millis(250)));
         drop(waiters);
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
+        // shortcut: the settlement waits for the card with no deadline of
+        // its own (it runs with the switch off too); it only counts against
+        // the 250 ms; give it one if runs show it long.
         #[cfg(windows)]
         if crate::host::late() {
             crate::host::settle_for_fence();
@@ -114,8 +120,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             }
         }
         #[cfg(windows)]
-        if let Some(latch) = blocking {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        if let Some((latch, deadline)) = blocking {
             if block_until(fence, value, latch, deadline) {
                 return S_OK;
             }
@@ -159,9 +164,9 @@ fn latch(waiters: &mut Vec<(u64, usize)>, value: u64) -> Option<usize> {
 }
 
 /// Waits until [`set`] reached `value` (`latch`, from [`latch`]), until
-/// `deadline` at most, every 10 ms running the queues' held lists (a
-/// signal may be behind them). Whether it got there; `latch` is gone
-/// afterwards.
+/// `deadline` at most, every 10 ms running the queues' held lists if no
+/// other thread is at it (a signal may be behind them). Whether it got
+/// there; `latch` is gone afterwards.
 #[cfg(windows)]
 fn block_until(fence: &Fence, value: u64, latch: usize, deadline: std::time::Instant) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
@@ -176,7 +181,7 @@ fn block_until(fence: &Fence, value: u64, latch: usize, deadline: std::time::Ins
         if left.is_zero() {
             break false;
         }
-        crate::queue::release_held(false);
+        crate::queue::try_release_held();
     };
     // Under the lock, so `set` no longer sets it once closed.
     fence.waiters.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.1 != latch);
