@@ -2401,6 +2401,10 @@ struct Deferred {
     /// With [`keep_once`]: the pipelines [`HostList::keep_pipeline`] kept,
     /// by address.
     bound: std::collections::HashSet<usize>,
+    /// With [`fill_once`]: scratch memory [`HostList::fill_scratch`] fills
+    /// since the list last wrote title memory (source, bytes), by its host
+    /// address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2432,6 +2436,7 @@ impl Deferred {
     fn title_written(&mut self) {
         self.refreshed.clear();
         self.gpu_written.clear();
+        self.filled.clear();
     }
 
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -4174,6 +4179,17 @@ fn declare_once() -> bool {
 fn keep_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a root constant buffer not 256-byte aligned is copied into the
+/// list's scratch memory once for all the draws of the list that bind it,
+/// until the list next writes title memory (`VICTORY_FILL_ONCE=1`; off by
+/// default: a copy of up to 64 KiB for every bind). After cgbj c96525d (from
+/// Belobug 84ea9c12). Its effect is in the frame log ("root constants
+/// filled again, left out").
+fn fill_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -7369,6 +7385,26 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host address of `len` bytes of the list's scratch memory that
+    /// hold title memory at `src` as of the list's submission: with
+    /// [`fill_once`] one fill for every ask until the list next writes
+    /// title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if fill_once()
+            && let Some(&gpu) = self.deferred().filled.get(&key)
+        {
+            crate::framelog::add(crate::framelog::T::FillsAgain, 1);
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        if fill_once() {
+            self.deferred().filled.insert(key, gpu);
+        }
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
