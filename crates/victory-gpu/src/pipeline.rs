@@ -741,26 +741,11 @@ pub(crate) extern "system" fn create_stream(
     }
     // SAFETY: the title passes `size` bytes of stream.
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
+    // SAFETY: the stream's pointers are the title's, live during creation.
     #[cfg(windows)]
-    let mut graphics = host::GraphicsState::default();
-    let shaders = read_stream(stream, copy, |_kind, _at| {
-        #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(_kind, _at)
-        };
-    });
-    // The whole state is read: integer targets do not blend on the host
-    // (`GraphicsState::integer_targets_do_not_blend`).
-    #[cfg(windows)]
-    if graphics.integer_targets_do_not_blend() {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| {
-            tracing::info!(
-                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
-            );
-        });
-    }
+    let (shaders, graphics) = unsafe { read_graphics(stream, copy) };
+    #[cfg(not(windows))]
+    let shaders = read_stream(stream, copy, |_, _| {});
     // SAFETY: the stream's pointers are the title's, live during creation.
     #[cfg(windows)]
     let record = prebuild::recording().then(|| unsafe { prebuild::portable(stream) });
@@ -773,6 +758,32 @@ pub(crate) extern "system" fn create_stream(
         iid,
         out,
     )
+}
+
+/// A stream's shaders and graphics state as the run uses them (and the
+/// pre-build replays them, so both give the same key): the whole state is
+/// read, then integer targets do not blend on the host
+/// (`GraphicsState::integer_targets_do_not_blend`).
+///
+/// # Safety
+/// The stream's pointers are live.
+#[cfg(windows)]
+unsafe fn read_graphics(
+    stream: &[u8],
+    shader: impl Fn(&'static str, &Bytecode) -> Option<Arc<Shader>>,
+) -> (Vec<Arc<Shader>>, host::GraphicsState) {
+    let mut graphics = host::GraphicsState::default();
+    // SAFETY: a whole subobject of this kind lies at `at`, its pointers live.
+    let shaders = read_stream(stream, shader, |kind, at| unsafe { graphics.read(kind, at) });
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
+    }
+    (shaders, graphics)
 }
 
 /// A stream's shaders, each made by `shader` from its stage and bytecode;

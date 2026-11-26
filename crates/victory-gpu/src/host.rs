@@ -452,6 +452,8 @@ fn poll_fence(
 /// that re-check the fence and the device, so an early wake or a lost
 /// signal costs at most a slice and a wait that never ends is logged. An
 /// event failure falls back to polling. Only device removal ends the wait.
+/// The event is asked for once: each slice re-asking piled up registrations
+/// on a fence that stalls.
 pub(crate) fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, target: u64, event: HANDLE) -> windows::core::Result<()> {
     static EVENT_FAILED: std::sync::Once = std::sync::Once::new();
     static LONG_WAIT: std::sync::Once = std::sync::Once::new();
@@ -459,6 +461,7 @@ pub(crate) fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, target:
     // SAFETY: the device and its fence are live; callers own or serialize
     // access to the event.
     unsafe {
+        let mut registered = false;
         loop {
             let completed = fence.GetCompletedValue();
             if fence_reached(completed, target) {
@@ -468,8 +471,10 @@ pub(crate) fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, target:
             if began.elapsed() >= std::time::Duration::from_secs(10) {
                 LONG_WAIT.call_once(|| tracing::warn!(target, completed, "a fence wait has gone on for over 10 s with the device healthy"));
             }
-            let failed = match fence.SetEventOnCompletion(target, event) {
+            let asked = if registered { Ok(()) } else { fence.SetEventOnCompletion(target, event) };
+            let failed = match asked {
                 Ok(()) => {
+                    registered = true;
                     let waited = WaitForSingleObject(event, 1000);
                     (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(|| format!("wait status {}", waited.0))
                 }

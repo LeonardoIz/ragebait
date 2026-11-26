@@ -496,8 +496,11 @@ fn library() -> Option<&'static Library> {
                 tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
                 return None;
             }
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let dir = DIR.get().map(PathBuf::as_path);
+            if !keeps(dir, BUSY.load(Ordering::Relaxed)) {
+                return None;
+            }
+            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = dir.map_or(Blob::None, Blob::of);
             let library = open(&device, blob, dir);
             if library.is_none() {
@@ -506,6 +509,12 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// Whether this process keeps a library: not while another process holds
+/// the cache folder, whose pipelines it could never save.
+fn keeps(dir: Option<&std::path::Path>, busy: bool) -> bool {
+    dir.is_some() || !busy
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -827,6 +836,15 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn a_folder_held_elsewhere_gives_no_library() {
+        let dir = std::path::Path::new("pipelines");
+        assert!(!keeps(None, true));
+        assert!(keeps(Some(dir), false));
+        // No folder configured: an in-memory library, as before.
+        assert!(keeps(None, false));
     }
 
     #[test]

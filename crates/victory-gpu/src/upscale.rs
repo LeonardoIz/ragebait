@@ -114,6 +114,7 @@ pub fn record(
                 .Flags
                 .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
             || matches!(uav.0, 29 | 87 | 91)
+            || !crate::descriptor::host::typed_store(uav.0 as u32)
         {
             return false;
         }
