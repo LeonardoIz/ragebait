@@ -2561,6 +2561,14 @@ fn buffer_uav(
         );
         return None;
     }
+    if !raw && stride == 0 && !typed_store(desc.Format.0 as u32) {
+        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        once!(
+            format = desc.Format.0,
+            "an unordered buffer view in a format the host cannot store left null"
+        );
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
