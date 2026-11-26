@@ -2768,9 +2768,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 );
                 return None;
             }
+            // D3D12 refuses a CBV over 64 KiB (4096 16-byte elements), and a
+            // release build can lose the device for it; no shader reads past that.
+            const MAX_CBV: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+            if size > MAX_CBV {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    size,
+                    "constant buffer view over 64 KiB; capped"
+                );
+            }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: size.next_multiple_of(256).min(MAX_CBV),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
