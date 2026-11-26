@@ -149,6 +149,9 @@ pub enum T {
     /// written 64 KiB pages a refresh left out, the 4 KiB parts that were
     /// not written since it last took them.
     PagePartsLeft,
+    /// With `VICTORY_UNDER_WIDE=1` (`crate::shadow`): pages under flights'
+    /// writes compared on several threads.
+    UnderWidePages,
     Count,
 }
 
@@ -472,7 +475,7 @@ fn text(f: &Frame) -> String {
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
-         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | submit side: landed pages looked at again {:.2} MB left, {:.2} MB sent; refresh parts {:.2} MB of written pages left out | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
+         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | submit side: landed pages looked at again {:.2} MB left, {:.2} MB sent; refresh parts {:.2} MB of written pages left out; under flights {:.0} pages compared wide | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
@@ -501,6 +504,7 @@ fn text(f: &Frame) -> String {
         t(T::LandEchoLeft) / 1e6,
         t(T::LandEchoSent) / 1e6,
         t(T::PagePartsLeft) / 1e6,
+        t(T::UnderWidePages),
         ms(T::CardIdleUs),
         ms(T::CardIdleBehindUs),
         ms(T::CardSyncUs),

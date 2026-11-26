@@ -2130,6 +2130,26 @@ mod part_tests {
     }
 }
 
+/// Whether [`Shadow::merge_under_writes`] reads and compares the pages of
+/// a range on several threads (`VICTORY_UNDER_WIDE=1`; off by default: one
+/// by one on the submitting thread). After cgbj b620284. Threads of its
+/// own, not those of [`wide`]: the thread waiting there takes whatever work
+/// comes, and the copy-back's merges take the reference's lock held here.
+/// The compare after the card ran is many-threaded already
+/// ([`wide_back`]). Its effect is in the frame log ("under flights").
+fn under_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNDER_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// The threads of [`under_wide`], the submitting one among them:
+/// `VICTORY_UNDER_THREADS` (4, sized for a processor of 16 threads; 1 to
+/// 16).
+fn under_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).clamp(1, 16))
+}
+
 /// The kernel's page: the unit [`land_echo`] compares.
 const KERNEL_PAGE: usize = 4096;
 
@@ -3642,6 +3662,12 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            if stale.len() > 2 && under_wide() {
+                if self.merge_pages_wide(a, e, now, &stale, runs_left) {
+                    return true;
+                }
+                continue;
+            }
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -3711,6 +3737,107 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] of the `stale` pages of the busy range
+    /// `[a, e)` (asked at `now`) with [`under_wide`]: the pages are read,
+    /// compared and put in on [`under_threads`] threads at once, under the
+    /// reference's lock held for all of them. Whether the caller must still
+    /// settle the flights (a snapshot is missing, or `runs_left` ran out:
+    /// the pages that fit stay done, as one by one).
+    fn merge_pages_wide(&self, a: usize, e: usize, now: u64, stale: &[usize], runs_left: &mut usize) -> bool {
+        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        // As one by one: the reference's lock from before title memory is
+        // read until the title's bytes are in.
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let card = self.card.is_some();
+        let held_base = if card {
+            self.data as usize
+        } else {
+            match before.as_mut() {
+                Some(snapshot) => snapshot.as_mut_ptr() as usize,
+                None => return true,
+            }
+        };
+        let left = AtomicI64::new(*runs_left as i64);
+        let over = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        // The pages put in, for `copied`.
+        let done: Mutex<Vec<usize>> = Mutex::default();
+        let work = || {
+            let mut title = vec![0u8; PAGE];
+            let mut mine = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&page) = stale.get(i) else {
+                    break;
+                };
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo >= hi || over.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let n = hi - lo;
+                let title = &mut title[..n];
+                // A page that is not there is left, and looked at next time.
+                if !crate::host::read_into(lo as *const u8, title) {
+                    continue;
+                }
+                MERGED[0].fetch_add(1, Ordering::Relaxed);
+                let at = lo - start;
+                // SAFETY: the reference (the copy's CPU side, or the
+                // snapshot, which holds the copy's bytes at the copy's
+                // offsets) is held under the lock taken above; the pages lie
+                // apart, each one this thread's alone.
+                let held = unsafe { std::slice::from_raw_parts_mut((held_base + at) as *mut u8, n) };
+                if card {
+                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    let count = runs.len() as i64;
+                    if count > 0 && left.fetch_sub(count, Ordering::Relaxed) < count {
+                        over.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    for (r, m) in runs {
+                        held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        self.card_changed(at + r, at + r + m);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                } else {
+                    for (r, m) in changed_runs(title, held) {
+                        // SAFETY: inside the copy's mapping, as one by one.
+                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                        held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                }
+                mine.push(page);
+            }
+            done.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+        };
+        let threads = under_threads().min(stale.len());
+        std::thread::scope(|s| {
+            for _ in 1..threads {
+                s.spawn(work);
+            }
+            work();
+        });
+        drop(before);
+        crate::framelog::add(crate::framelog::T::UnderWidePages, stale.len() as u64);
+        *runs_left = left.into_inner().max(0) as usize;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            // Taken, if the range holds all of the page that is in the copy;
+            // else the rest of it is the refresh's.
+            if (page * PAGE).max(start) >= a
+                && ((page + 1) * PAGE).min(end) <= e
+                && let Some(at) = copied.get_mut(page - start / PAGE)
+            {
+                *at = now;
+            }
+        }
+        over.into_inner()
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -5156,6 +5283,35 @@ mod card_merge_tests {
                 .ok()?;
             buffer
         }
+    }
+
+    /// `VICTORY_UNDER_WIDE`'s merge on several threads puts the title's
+    /// changed bytes into the copy and its snapshot, every page, and notes
+    /// the pages taken.
+    #[test]
+    fn pages_merged_wide_take_the_titles_bytes() {
+        use super::PAGE;
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        let len = 3 * PAGE + 100;
+        let mut title: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        let mut side = title.clone();
+        let (start, end) = (title.as_ptr() as usize, title.as_ptr() as usize + len);
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, start as u64, len as u64);
+        *shadow.before.get_mut().unwrap() = Some(side.clone());
+        // The title writes a byte in every 64 KiB page after the copy took it.
+        for at in (5..len).step_by(PAGE / 2) {
+            title[at] ^= 0x5a;
+        }
+        let stale: Vec<usize> = (start / PAGE..=(end - 1) / PAGE).collect();
+        let mut runs_left = usize::MAX;
+        assert!(!shadow.merge_pages_wide(start, end, 9, &stale, &mut runs_left));
+        assert!(*shadow.before.get_mut().unwrap().as_ref().unwrap() == title);
+        // (The range is all of the copy: every page's part in it is whole.)
+        assert!(shadow.copied.get_mut().unwrap().iter().all(|&at| at == 9));
+        drop(shadow);
+        assert!(side == title);
     }
 
     /// The mixed landing the fetch inside flights must survive, on a real
