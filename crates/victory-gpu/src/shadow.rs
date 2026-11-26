@@ -274,6 +274,21 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// `VICTORY_CARD_ROOM_SHARED=1` uses the same buffer-copy cap for allocation
+/// and reservation, and counts that reservation in texture admission and
+/// eviction pressure. Off by default.
+pub(crate) fn card_room_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_SHARED").is_some_and(|v| v == "1"))
+}
+
+fn card_copy_limit(configured: u64, shared: bool) -> u64 {
+    // shortcut: 1 GiB covers the observed card copies. Revisit if traces
+    // show useful copies spilling to system memory at the cap. An oversized
+    // reservation left textures unavailable and geometry black with VRAM free.
+    if shared { configured.min(1 << 30) } else { configured }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -281,7 +296,9 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_copy_limit(card_limits().1, card_room_shared())
+        .saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+        .saturating_sub(CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -373,7 +390,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
+    let (least, configured) = card_limits();
     if size < least || size >= 1 << 30 {
         return None;
     }
@@ -381,6 +398,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    let shared = card_room_shared();
+    let most = card_copy_limit(configured, shared);
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -415,8 +434,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    if CARD_BYTES[0]
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+            bytes.checked_add(size).filter(|&total| total <= most)
+        })
+        .is_err()
+    {
+        if shared {
+            crate::framelog::add(crate::framelog::T::CardRoomSharedRefusals, 1);
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -424,6 +450,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+#[cfg(test)]
+#[test]
+fn shared_card_copy_limit_respects_smaller_caps() {
+    assert_eq!(card_copy_limit(2 << 30, false), 2 << 30);
+    assert_eq!(card_copy_limit(2 << 30, true), 1 << 30);
+    assert_eq!(card_copy_limit(512 << 20, true), 512 << 20);
+    assert_eq!(card_copy_limit(0, true), 0);
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's

@@ -1481,16 +1481,25 @@ fn texture_bytes() -> u64 {
     KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total()
 }
 
+#[cfg(windows)]
+const TEXTURE_ROOM_FLOOR: u64 = 2 << 30;
+
+/// Future buffer copies and render targets count against texture room.
+#[cfg(windows)]
+fn texture_vram_used(used: u64) -> u64 {
+    used.saturating_add(crate::shadow::card_room_kept())
+        .saturating_add(targets_room_kept())
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to [`TEXTURE_ROOM_FLOOR`] bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
-    const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
@@ -1498,19 +1507,18 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = texture_budget() {
         return filled < limit;
     }
-    if filled < FLOOR {
+    if filled < TEXTURE_ROOM_FLOOR {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => texture_vram_used(used) < texture_vram_limit(budget),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+#[cfg(windows)]
+fn texture_vram_limit(budget: u64) -> u64 {
+    budget / 100 * room_percent()
 }
 
 /// The bytes of the card's memory the texture queue leaves free for

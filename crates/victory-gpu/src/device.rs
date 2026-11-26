@@ -346,7 +346,8 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// Graphics (0x1c8) and compute (0x218) pipeline-state deserialization,
+/// as identified in the public console device ABI notes. The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
@@ -356,7 +357,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// methods can be written.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
-extern "system" fn unknown_pipeline<const SLOT: usize>(
+extern "system" fn deserialize_pipeline_state<const SLOT: usize>(
     _: This,
     desc: *const u8,
     _iid: *const Iid,
@@ -435,10 +436,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = deserialize_pipeline_state::<0x1c8> as *const (); // graphics
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = deserialize_pipeline_state::<0x218> as *const (); // compute
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
