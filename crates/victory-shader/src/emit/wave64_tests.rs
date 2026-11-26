@@ -105,7 +105,17 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
-    let st = structure::structure_wide(p, wide).expect("structure");
+    lowered_with_entry(native, p, wide, host_wave, false)
+}
+
+fn lowered_with_entry(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+    entry_limited: bool,
+) -> Result<HostShader, ShaderError> {
+    let st = structure::structure_with_entry(p, wide, entry_limited).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
@@ -576,4 +586,63 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A dispatch by thread counts (the console's `DispatchX` with the card's "use thread
+/// dimensions" bit): the last group's wave starts with only the lanes below the count in
+/// EXEC. Every lane stores the number of lanes in EXEC at its own dword: with the count in
+/// the host's word, the lanes below it store the count and the others store nothing; with
+/// no limit all 64 store 64. One console wave as two host waves of 32, so the count also
+/// crosses the halves.
+#[test]
+fn lanes_past_a_dispatchs_thread_count_start_outside_exec() {
+    let words = [
+        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_with_entry(&native, &p, &HashSet::new(), 32, true).expect("lower");
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::shader::USER_THREAD_LIMIT))
+        .expect("the program asks for the thread count")
+        .index as usize;
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    for threads in [0, 64, 63, 33, 32, 31, 6, 1] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        ud[limit] = threads;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let run = if threads == 0 { 64 } else { threads };
+        let expected: Vec<u32> = (0..64).map(|lane| if lane < run { run } else { 0 }).collect();
+        assert_eq!(out[0], expected, "a dispatch of {threads} threads");
+    }
+    eprintln!("ran on the hardware device: the lanes below the count store it, the others nothing");
 }

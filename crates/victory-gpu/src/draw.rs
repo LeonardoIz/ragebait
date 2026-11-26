@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
+use crate::ambient;
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -1506,6 +1507,9 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return 0;
+        }
         if kind == USER_DISPATCH_SPREAD {
             return self.dispatch_spread[usize::from(dword != 0)];
         }
@@ -1597,7 +1601,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, p, false, None) {
             return false;
         }
         let l = &list.list;
@@ -1676,7 +1680,13 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        mut ambient: Option<(ambient::Selection<'_>, &mut Option<ambient::Views>)>,
+    ) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1745,6 +1755,12 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
                 return false;
+            }
+            if let Some((selection, views)) = &mut ambient {
+                **views = self.ambient_views(&t.used, &made, selection);
+                if views.is_none() {
+                    once!(shader = %stage.shader.hash, "ambient selector did not match compatible bound views");
+                }
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -3130,7 +3146,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
@@ -3173,16 +3189,52 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // DispatchX bit 5 means its dimensions are counts of threads.
+        let counted = flags & 0x20 != 0 && victory_shader::emit::rt_dispatch_fix();
+        let (groups, limit) = if counted {
+            let Some(plan) = p.stages.first().and_then(|stage| {
+                let t = stage.translated();
+                let word = stage.user_data.and_then(|(param, _)| {
+                    t.host.user_data.iter()
+                        .find(|u| u.root == RootType::Other(victory_shader::emit::USER_THREAD_LIMIT))
+                        .map(|u| (param, u.index))
+                });
+                let (groups, partial) = thread_groups([x, y, z], t.threads?, word.is_some())?;
+                Some((groups, if partial { word } else { None }))
+            }) else {
+                once!("a thread-count dispatch has unknown group size or unsupported partial groups");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a thread-count dispatch could not be represented");
+                }
+                return;
+            };
+            plan
+        } else {
+            ([x, y, z], None)
+        };
+        let [group_x, group_y, group_z] = groups;
         // More than 65,535 groups in x: spread across z for a program that
         // takes the spread words (`USER_DISPATCH_SPREAD`).
-        let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
+        let (row, asked, gx, gy, gz) =
+            victory_shader::emit::spread_groups(group_x, group_y, group_z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
         } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
         self.dispatch_spread = [row, asked];
-        let bound = self.bind(list, p, true);
+        let mut ambient_views = None;
+        let ambient = if gx != 0 && gy != 0 && gz != 0 {
+            p.stages
+                .first()
+                .and_then(|stage| ambient::select(&stage.shader.hash))
+        } else {
+            None
+        };
+        let bound = self.bind(
+            list, p, true, ambient.map(|selection| (selection, &mut ambient_views)),
+        );
         self.dispatch_spread = [0, 0];
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3196,8 +3248,83 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(gx, gy, gz) };
+        unsafe {
+            if let Some((param, word)) = limit {
+                list.list.SetComputeRoot32BitConstant(param, x, word);
+            }
+            list.list.Dispatch(gx, gy, gz);
+        }
+        if counted {
+            crate::framelog::add(crate::framelog::T::ThreadDispatches, 1);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(views) = ambient_views
+            && ambient::after(list, views)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    fn ambient_views(
+        &self,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+        selection: &ambient::Selection<'_>,
+    ) -> Option<ambient::Views> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R32_UINT,
+        };
+
+        if self.heaps[0] == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let host = heap.host()?;
+        let entry = |binding: &ambient::Binding, kind| {
+            if !used.iter().any(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (binding.slot, binding.dword)
+            }) {
+                return None;
+            }
+            let Root::Table(table) = self.compute.get(usize::from(binding.slot))? else {
+                return None;
+            };
+            let handle = table.checked_add(u64::from(binding.dword) * 4)?;
+            let title_index = heap.index(handle)?;
+            if heap.handle(title_index) != Some(handle) || heap.index(*table).is_none() {
+                return None;
+            }
+            let index = if let Some(&(_, offset)) = made.iter().find(|m| m.0 == binding.slot) {
+                offset / 32 + binding.dword / 8
+            } else {
+                if title_index >= host.count() {
+                    return None;
+                }
+                title_index
+            };
+            Some((crate::descriptor::view(handle)?, host.gpu_handle(index)))
+        };
+        let (image, image_handle) = entry(selection.image, ResourceType::Uav)?;
+        let format = if selection.depth.is_some() {
+            DXGI_FORMAT_R32_UINT
+        } else {
+            DXGI_FORMAT_R11G11B10_FLOAT
+        };
+        let (output, size) = ambient::image(&image, Some(format))?;
+        let depth = if let Some(binding) = selection.depth {
+            let (view, handle) = entry(binding, ResourceType::Srv)?;
+            let (resource, depth_size) = ambient::image(&view, None)?;
+            if resource == output || depth_size != size {
+                return None;
+            }
+            Some(handle)
+        } else {
+            None
+        };
+        Some(ambient::Views { image: image_handle, depth, size })
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4398,7 +4525,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind(list, p, true, None),
             _ => false,
         };
         if !ran {
@@ -4440,6 +4567,29 @@ impl State {
         }
         true
     }
+}
+
+/// shortcut: partial groups along Y or Z and shaders without an X mask
+/// are unsupported, until the translator masks those cases.
+fn thread_groups(threads: [u32; 3], size: [u32; 3], mask_x: bool) -> Option<([u32; 3], bool)> {
+    if size.contains(&0) || !(1..3).all(|i| threads[i].is_multiple_of(size[i])) {
+        return None;
+    }
+    let partial = !threads[0].is_multiple_of(size[0]);
+    if partial && !mask_x {
+        return None;
+    }
+    Some((std::array::from_fn(|i| threads[i].div_ceil(size[i])), partial))
+}
+
+#[cfg(test)]
+#[test]
+fn thread_counts_use_the_shader_group_size() {
+    assert_eq!(thread_groups([65, 1, 1], [64, 1, 1], true), Some(([2, 1, 1], true)));
+    assert_eq!(thread_groups([64, 4, 0], [32, 2, 1], false), Some(([2, 2, 0], false)));
+    assert_eq!(thread_groups([65, 1, 1], [64, 1, 1], false), None);
+    assert_eq!(thread_groups([64, 3, 1], [64, 2, 1], true), None);
+    assert_eq!(thread_groups([1, 1, 1], [0, 1, 1], true), None);
 }
 
 /// The host command signature for one argument of `kind` with records

@@ -63,6 +63,11 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
+- With VICTORY_RT_DISPATCH_FIX=1, DispatchX flag 0x20 gives thread counts.
+  The host rounds them to groups, and translated builder shaders start with
+  the excess X lanes outside EXEC. Partial Y or Z groups and partial X
+  groups without a translated mask are dropped. This switch does not enable
+  the builder. Framelog counts host calls under "thread-count dispatches".
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
@@ -73,6 +78,29 @@ shaders and emulates the one instruction.
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
 - Cost on the GPU is unmeasured.
+
+## Ambient lighting stand-in
+
+With the ray-tracing builder disabled or unavailable, selected direct compute
+dispatches can sample the screen's radiance and estimate diffuse indirect light.
+Set VICTORY_AMBIENT in one of these forms.
+
+~~~text
+constant:<level>@<resolve-hash>:<light-slot>:<light-dword>:<depth-slot>:<depth-dword>
+<level>@<resolve-hash>:<light-slot>:<light-dword>:<depth-slot>:<depth-dword>@<radiance-hash>:<radiance-slot>:<radiance-dword>
+~~~
+
+Use the 16-digit shader hashes from local "shader translated" logs. Supply
+root table slots and offsets within each table in dwords (eight per descriptor).
+The resolve requires a 2D R32_UINT UAV holding RGB9E5 pixels and a compatible
+2D float depth SRV of the same size. The estimate requires a 2D R11G11B10_FLOAT
+radiance UAV and hardware typed UAV loads for that format. The level is a
+positive finite number. An unset or invalid selector disables the pass.
+
+Constant mode replaces the selected light with a shaded constant. Estimate
+mode uses visible light, assumes a fixed camera projection and estimates
+occlusion from nearby depth. It can add substantial GPU work. Framelog
+reports "ambient" samples and resolves recorded on the host.
 
 ## Where to look
 

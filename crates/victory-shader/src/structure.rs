@@ -409,6 +409,8 @@ pub enum LaneExit {
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {
+    /// Whether EXEC on entry can exclude threads past a dispatch's X limit.
+    pub(crate) entry_limited: bool,
     pub bools: Bools,
     /// Per block.
     pub exits: Vec<LaneExit>,
@@ -469,7 +471,16 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
+    structure_with_entry(program, wide, false)
+}
+
+pub(crate) fn structure_with_entry(
+    program: &Program,
+    wide: &HashSet<usize>,
+    entry_limited: bool,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.entry_limited = entry_limited;
     l.wide = wide.clone();
     loop {
         let execs = l.masks_in_order();
@@ -492,6 +503,7 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
 type Key = (Value, Value);
 
 struct Lanes<'a> {
+    entry_limited: bool,
     p: &'a Program,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
@@ -596,6 +608,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Lanes {
             p,
+            entry_limited: false,
             order,
             index,
             incoming,
@@ -647,7 +660,12 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            let entry = if self.entry_limited {
+                self.b.atom(Atom::Lane(lo), 0)
+            } else {
+                Bool::TRUE
+            };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
@@ -839,6 +857,7 @@ impl<'a> Lanes<'a> {
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
+            entry_limited: self.entry_limited,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
