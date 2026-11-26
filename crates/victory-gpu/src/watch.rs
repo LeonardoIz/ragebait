@@ -91,20 +91,28 @@ pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
 }
 
-/// Kernel answers (addresses of written 4 KiB pages, in order) as 64 KiB
-/// pages, each once, with their written parts (all of them without
-/// [`parts_on`]).
-fn pages_and_parts(found: &[usize]) -> Vec<(usize, u16)> {
-    let mut pages: Vec<(usize, u16)> = Vec::new();
+/// Notes the first `count` kernel answers in `j.found` (addresses of
+/// written 4 KiB pages, in order) as written by asking `now`: each 64 KiB
+/// page once, with its written parts (all of them without [`parts_on`]).
+/// Streams into the journal: nothing is allocated.
+fn note_found(j: &mut Journal, count: usize, now: u64) {
     let on = parts_on();
-    for &at in found {
+    let mut run: Option<(usize, u16)> = None;
+    for k in 0..count {
+        let at = j.found[k];
         let (page, part) = (at / PAGE, if on { 1u16 << (at % PAGE / KERNEL_PAGE) } else { WHOLE });
-        match pages.last_mut() {
+        match &mut run {
             Some((last, parts)) if *last == page => *parts |= part,
-            _ => pages.push((page, part)),
+            _ => {
+                if let Some((last, parts)) = run.replace((page, part)) {
+                    j.note(last, parts, now);
+                }
+            }
         }
     }
-    pages
+    if let Some((last, parts)) = run {
+        j.note(last, parts, now);
+    }
 }
 
 /// A title-memory range whose changed pages another subsystem needs to read.
@@ -444,9 +452,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for (page, parts) in pages_and_parts(&j.found[..count]) {
-        j.note(page, parts, now);
-    }
+    note_found(j, count, now);
     true
 }
 
@@ -551,9 +557,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = pages_and_parts(&j.found[..count]).into_iter().chain(guarded.into_iter().map(|page| (page, WHOLE)));
-    for (page, parts) in pages.collect::<Vec<_>>() {
-        j.note(page, parts, now);
+    note_found(j, count, now);
+    for page in guarded {
+        j.note(page, WHOLE, now);
     }
     Some((
         now,
@@ -1644,6 +1650,12 @@ mod parts_tests {
         // A page first named in part: what was not named was not written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+        // Kernel answers stream in: each page once, only the first `count`.
+        j.found = vec![20 * PAGE, 20 * PAGE + KERNEL_PAGE, 21 * PAGE, 30 * PAGE];
+        note_found(&mut j, 3, 10);
+        assert_eq!(j.written.get(&20), Some(&10));
+        assert_eq!(j.written.get(&21), Some(&10));
+        assert_eq!(j.written.get(&30), None);
     }
 }
 

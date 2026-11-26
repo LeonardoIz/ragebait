@@ -4009,8 +4009,11 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        // Stale pages and the asking each was taken at before.
+        let parts_on = crate::watch::parts_on();
+        // With parts: stale pages and the asking each was taken at before.
+        // Without: runs of stale pages copied while walking, nothing kept.
         let mut stale: Vec<(usize, u64)> = Vec::new();
+        let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4022,25 +4025,33 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
-                stale.push((page, *at));
+                if parts_on {
+                    stale.push((page, *at));
+                } else {
+                    run.get_or_insert(page);
+                }
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
+            } else if let Some(first) = run.take() {
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
-        let parts = if crate::watch::parts_on() { crate::watch::parts_written(&stale) } else { Vec::new() };
-        let ranges = part_ranges(&stale, &parts);
-        if !parts.is_empty() {
-            let whole: usize = parts.iter().filter(|&&p| p != u16::MAX).count() * PAGE;
-            let taken: usize = parts.iter().filter(|&&p| p != u16::MAX).map(|p| p.count_ones() as usize * (PAGE / 16)).sum();
-            crate::framelog::add(crate::framelog::T::PagePartsLeft, (whole - taken) as u64);
-        }
         // Cut to the range: next to it shaders may be writing the copy.
-        let mut bytes = 0;
-        for (a, b) in ranges {
+        if let Some(first) = run {
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        if stale.is_empty() {
+            return bytes;
+        }
+        let parts = crate::watch::parts_written(&stale);
+        let whole: usize = parts.iter().filter(|&&p| p != u16::MAX).count() * PAGE;
+        let taken: usize = parts.iter().filter(|&&p| p != u16::MAX).map(|p| p.count_ones() as usize * (PAGE / 16)).sum();
+        crate::framelog::add(crate::framelog::T::PagePartsLeft, (whole - taken) as u64);
+        for (a, b) in part_ranges(&stale, &parts) {
             let (a, b) = (a.max(from), b.min(to));
             if a < b {
                 bytes += self.copy(a, b);
