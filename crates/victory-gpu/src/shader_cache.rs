@@ -47,7 +47,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build() -> [u8; 32] {
+fn build(wave_wide: bool) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -74,7 +74,32 @@ fn build() -> [u8; 32] {
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     h.update(include_bytes!("shader_cache.rs"));
+    h.update(&[u8::from(wave_wide)]);
     *h.finalize().as_bytes()
+}
+
+// Wave64 compute shaders that ran with wave-wide branches on a 32-lane host
+// in victory-fork #1248. Keep 369cbe906ea72764 out of the defaults because
+// it stalled the GPU. 5dc3b25986622949 and 6f225b641c5b0708 caused water artifacts.
+const WAVE_WIDE_SEEN: [&str; 3] = ["a10179ab7eda0dc3", "926c46bab3b86bd6", "2cc4c197ee29e291"];
+
+fn wave_wide(container: &[u8]) -> bool {
+    // VICTORY_WAVE_WIDE_LIST adds comma-separated hashes. VICTORY_WAVE_WIDE_SEEN=0
+    // disables the defaults. VICTORY_WAVE_WIDE=0 overrides both in the translator.
+    static OPTIONS: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    let (seen, added) = OPTIONS.get_or_init(|| {
+        let seen = std::env::var_os("VICTORY_WAVE_WIDE_SEEN").is_none_or(|v| v != "0");
+        let added = std::env::var("VICTORY_WAVE_WIDE_LIST")
+            .map(|v| v.split(',').map(|h| h.trim().to_ascii_lowercase()).collect())
+            .unwrap_or_default();
+        (seen, added)
+    });
+    let hash = blake3::hash(container).to_hex();
+    wave_wide_selected(&hash[..16], *seen, added)
+}
+
+fn wave_wide_selected(hash: &str, seen: bool, added: &[String]) -> bool {
+    (seen && WAVE_WIDE_SEEN.contains(&hash)) || added.iter().any(|h| h == hash)
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
@@ -84,19 +109,21 @@ fn build() -> [u8; 32] {
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);
+    let wide = wave_wide(container);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        victory_shader::emit::translate_with_wave_wide(c, wide).map_err(|e| e.to_string())
     };
-    cached(cache, &build(), container, translate, true).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(wide), container, translate, true).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wide = wave_wide(container);
+    let translate = |c: &[u8]| victory_shader::emit::translate_with_wave_wide(c, wide).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, false),
+        Some(cache) => cached(cache, &build(wide), container, translate, false),
         None => translate(container),
     }
 }
@@ -339,6 +366,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_wide_selection_uses_defaults_and_explicit_additions() {
+        assert!(wave_wide_selected("2cc4c197ee29e291", true, &[]));
+        assert!(!wave_wide_selected("369cbe906ea72764", true, &[]));
+        assert!(!wave_wide_selected("2cc4c197ee29e291", false, &[]));
+        assert!(wave_wide_selected("0123456789abcdef", false, &["0123456789abcdef".into()]));
+        assert_ne!(build(true), build(false));
+    }
 
     fn shader() -> HostShader {
         HostShader {
