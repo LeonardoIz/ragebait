@@ -457,22 +457,6 @@ mod own_tests {
     }
 }
 
-/// The process's memory in bytes: in physical memory, and committed
-/// (private bytes).
-fn process_memory() -> (u64, u64) {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut c = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
-}
-
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
 fn system_memory() -> (u64, u64) {
@@ -683,7 +667,7 @@ fn log_memory_map() {
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
-    let (working, private) = process_memory();
+    let (working, private) = crate::framelog::process_memory().unwrap_or_default();
     let (free, left) = system_memory();
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
@@ -957,17 +941,6 @@ fn thread_times() -> (u64, u64) {
     (micros(user), micros(kernel))
 }
 
-/// The process's processor time so far (user, kernel), in microseconds.
-fn process_times() -> (u64, u64) {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: our own process and four valid out pointers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
-    (micros(user), micros(kernel))
-}
-
 fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     let at = match all.iter().position(|s| s.0 == id) {
         Some(at) => at,
@@ -1162,7 +1135,7 @@ pub(crate) fn log(frames: f64) {
     // processor time of the whole process, and what each submitting and
     // recording thread did.
     static CPU: Mutex<(u64, u64)> = Mutex::new((0, 0));
-    let (user, kernel) = process_times();
+    let (user, kernel) = crate::framelog::process_times().unwrap_or_default();
     let (user, kernel) = {
         let mut last = CPU.lock().unwrap_or_else(|e| e.into_inner());
         let spent = (user.saturating_sub(last.0), kernel.saturating_sub(last.1));

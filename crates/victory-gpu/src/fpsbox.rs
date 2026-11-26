@@ -1,4 +1,4 @@
-//! The frame rate, drawn into the top left corner of every frame shown.
+//! Frame rate and process statistics in the top left corner of the picture.
 //!
 //! The window's caption has the frame rate, but a capture of the window's
 //! picture (a stream) does not carry the caption. Here the number is part
@@ -8,32 +8,144 @@
 //! back from it are as before.
 //!
 //! The text is drawn on the CPU with a font of its own (5 by 7 dots a
-//! glyph) into a buffer the card copies from; a buffer is made once for a
-//! text and never written again, so a present still in the air reads what
-//! it was recorded with. On by default; `VICTORY_FPS_COUNTER=0` leaves the
-//! frame as the title drew it.
+//! glyph) into an immutable upload buffer. Each command list keeps the
+//! buffer alive until the list is reset.
 
-use std::collections::{HashMap, hash_map::Entry};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::ptr::null_mut;
+use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows_sys::Win32::System::Performance::*;
+use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetCurrentProcessId};
 
-/// The frame rate in tenths of a frame a second, as last measured (once a
-/// second, by the presenter's meter); `u32::MAX` before the first.
-static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
+use crate::host::{Host, HostList};
 
-/// Whether the counter is drawn.
-fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0"))
+/// Resource values at display precision (tenths of a percent or GB).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stats {
+    cpu: Option<u32>,
+    gpu: Option<u32>,
+    ram: Option<[u64; 2]>,
+    vram: Option<[u64; 2]>,
 }
 
-/// The frame rate just measured.
-pub(crate) fn set(fps: f64) {
-    if fps.is_finite() && fps >= 0.0 {
-        TENTHS.store((fps * 10.0).round().min(99_999.0) as u32, Ordering::Relaxed);
+impl Stats {
+    const UNAVAILABLE: Self = Self {
+        cpu: None,
+        gpu: None,
+        ram: None,
+        vram: None,
+    };
+}
+
+static STATS: Mutex<Stats> = Mutex::new(Stats::UNAVAILABLE);
+
+fn tenths(value: f64) -> u32 {
+    (value * 10.0).round() as u32
+}
+
+fn cpu_percent(cpu_us: u64, wall: Duration, logical_cpus: u32) -> Option<f64> {
+    let capacity = wall.as_secs_f64() * 1e6 * f64::from(logical_cpus);
+    (capacity > 0.0).then(|| cpu_us as f64 / capacity * 100.0)
+}
+
+fn gb_tenths(bytes: u64) -> u64 {
+    const TENTH_GB: u64 = 100_000_000;
+    bytes / TENTH_GB + u64::from(bytes % TENTH_GB >= TENTH_GB / 2)
+}
+
+struct GpuEngines {
+    query: PDH_HQUERY,
+    counter: PDH_HCOUNTER,
+}
+
+impl GpuEngines {
+    fn open() -> Option<Self> {
+        let mut query = null_mut();
+        // SAFETY: the query and counter outputs are writable, and the path
+        // is NUL terminated. The query owns the counter.
+        unsafe {
+            if PdhOpenQueryW(null_mut(), 0, &mut query) != 0 {
+                return None;
+            }
+            let mut engines = Self {
+                query,
+                counter: null_mut(),
+            };
+            // Include the separator so another PID with the same digits
+            // at its start cannot match.
+            let path: Vec<u16> = format!(r"\GPU Engine(pid_{}_*)\Utilization Percentage", GetCurrentProcessId())
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            (PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut engines.counter) == 0).then_some(engines)
+        }
+    }
+
+    fn sample(&self) -> Option<u32> {
+        let (mut bytes, mut count) = (0, 0);
+        // SAFETY: the query owns a live counter. PDH first reports the
+        // size, then fills aligned storage for the items and their names.
+        unsafe {
+            if PdhCollectQueryData(self.query) != 0
+                || PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, null_mut())
+                    != PDH_MORE_DATA
+            {
+                return None;
+            }
+            let mut items = vec![
+                PDH_FMT_COUNTERVALUE_ITEM_W::default();
+                (bytes as usize).div_ceil(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>())
+            ];
+            if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, items.as_mut_ptr()) != 0 {
+                return None;
+            }
+            items
+                .get(..count as usize)?
+                .iter()
+                .filter_map(|item| {
+                    if !matches!(item.FmtValue.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
+                        return None;
+                    }
+                    let value = item.FmtValue.Anonymous.doubleValue;
+                    (value.is_finite() && value >= 0.0).then(|| tenths(value))
+                })
+                .max()
+        }
+    }
+}
+
+impl Drop for GpuEngines {
+    fn drop(&mut self) {
+        // SAFETY: this owns the open query and any counter added to it.
+        unsafe { PdhCloseQuery(self.query) };
+    }
+}
+
+fn sample_stats(host: &Host) {
+    // SAFETY: this query takes a processor group number or all groups.
+    let cores = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    let gpu = GpuEngines::open();
+    let mut last_cpu = None;
+    loop {
+        let now = Instant::now();
+        let current = crate::framelog::process_times().map(|(user, kernel)| (now, user + kernel));
+        let cpu = current
+            .zip(last_cpu)
+            .and_then(|((now, total), (then, old))| cpu_percent(total.checked_sub(old)?, now - then, cores).map(tenths));
+        last_cpu = current;
+        let stats = Stats {
+            cpu,
+            gpu: gpu.as_ref().and_then(GpuEngines::sample),
+            ram: crate::framelog::process_memory().map(|(working, commit)| [working, commit].map(gb_tenths)),
+            vram: host
+                .video_memory_groups()
+                .map(|[local, _]| [local[1], local[0]].map(gb_tenths)),
+        };
+        *STATS.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -54,13 +166,55 @@ fn glyph(c: char) -> [u8; 7] {
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'a' => [0, 0, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'm' => [0, 0, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
+        'n' => [0, 0, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+        's' => [0, 0, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        '/' => [0b00001, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000],
+        '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         _ => [0; 7],
     }
 }
 
-/// The text for a frame rate in tenths.
-fn text(tenths: u32) -> String {
-    format!("{}.{} FPS", tenths / 10, tenths % 10)
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Display {
+    fps: u32,
+    ms: u32,
+    stats: Option<Stats>,
+}
+
+impl Display {
+    fn text(self) -> String {
+        use std::fmt::Write;
+
+        fn decimal(tenths: u64) -> String {
+            format!("{}.{}", tenths / 10, tenths % 10)
+        }
+
+        let mut text = format!("FPS {} / {} ms", decimal(self.fps.into()), decimal(self.ms.into()));
+        if let Some(stats) = self.stats {
+            for (label, value) in [("CPU %", stats.cpu), ("GPU %", stats.gpu)] {
+                let value = value.map_or_else(|| "n/a".into(), |v| decimal(v.into()));
+                let _ = write!(text, "\n{label} {value}");
+            }
+            for (label, value) in [("RAM", stats.ram), ("VRAM", stats.vram)] {
+                let value = value.map_or_else(
+                    || "n/a".into(),
+                    |[used, limit]| format!("{} / {} GB", decimal(used), decimal(limit)),
+                );
+                let _ = write!(text, "\n{label} {value}");
+            }
+        }
+        text
+    }
 }
 
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
@@ -110,22 +264,25 @@ fn half(v: f32) -> u16 {
 /// The box for `text` at `scale` dots a pixel: its width and height in
 /// pixels and, row by row from the top, whether each pixel is text.
 fn bitmap(text: &str, scale: u32) -> (u32, u32, Vec<bool>) {
-    let chars: Vec<char> = text.chars().collect();
     let pad = 2 * scale;
-    let width = 2 * pad + chars.len() as u32 * 6 * scale - scale;
-    let height = 2 * pad + 7 * scale;
+    let columns = text.lines().map(|line| line.chars().count()).max().unwrap_or(0).max(1) as u32;
+    let lines = text.lines().count().max(1) as u32;
+    let width = 2 * pad + (columns * 6 - 1) * scale;
+    let height = 2 * pad + (lines * 9 - 2) * scale;
     let mut lit = vec![false; (width * height) as usize];
-    for (i, &c) in chars.iter().enumerate() {
-        let rows = glyph(c);
-        for (row, bits) in rows.into_iter().enumerate() {
-            for column in 0..5u32 {
-                if bits >> (4 - column) & 1 == 0 {
-                    continue;
-                }
-                let (x0, y0) = (pad + (i as u32 * 6 + column) * scale, pad + row as u32 * scale);
-                for y in y0..y0 + scale {
-                    for x in x0..x0 + scale {
-                        lit[(y * width + x) as usize] = true;
+    for (line, text) in text.lines().enumerate() {
+        for (i, c) in text.chars().enumerate() {
+            for (row, bits) in glyph(c).into_iter().enumerate() {
+                for column in 0..5u32 {
+                    if bits >> (4 - column) & 1 == 0 {
+                        continue;
+                    }
+                    let x0 = pad + (i as u32 * 6 + column) * scale;
+                    let y0 = pad + (line as u32 * 9 + row as u32) * scale;
+                    for y in y0..y0 + scale {
+                        for x in x0..x0 + scale {
+                            lit[(y * width + x) as usize] = true;
+                        }
                     }
                 }
             }
@@ -142,41 +299,80 @@ struct Made {
     pitch: u32,
 }
 
-// SAFETY: a free-threaded D3D12 object and plain numbers.
-unsafe impl Send for Made {}
+pub(crate) struct Overlay {
+    on: bool,
+    stats: bool,
+    rate: Option<(u32, u32)>,
+    /// Only the current text, format and scale are cached.
+    made: Option<((Display, DXGI_FORMAT, u32), Made)>,
+}
 
-/// The boxes made so far, by text, format and scale.
-static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
+impl Overlay {
+    pub(crate) fn new() -> Self {
+        // VICTORY_FPS_COUNTER=0 hides the overlay. VICTORY_STATS=0 shows
+        // the FPS line alone and skips background resource sampling.
+        let on = std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0");
+        let stats = on && std::env::var_os("VICTORY_STATS").is_none_or(|v| v != "0");
+        if stats {
+            static START: Once = Once::new();
+            START.call_once(|| {
+                let _ = std::thread::Builder::new().name("victory-stats".into()).spawn(|| {
+                    if let Some(host) = crate::host::host() {
+                        sample_stats(host);
+                    }
+                });
+            });
+        }
+        Self {
+            on,
+            stats,
+            rate: None,
+            made: None,
+        }
+    }
 
-/// Copies the frame rate's box onto `back`, a back buffer of `width` by
-/// `height` pixels of `format` that `list` holds as a copy's destination.
-/// Nothing if the counter is off, no rate was measured yet, the format is
-/// not one of ours or the frame is too small for the box.
-pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
-    if !on() {
-        return;
+    /// Updates the rate from the presenter's one-second meter.
+    pub(crate) fn set_rate(&mut self, fps: f64, ms: f64) {
+        if self.on {
+            self.rate = Some((tenths(fps).min(99_999), tenths(ms)));
+        }
     }
-    let tenths = TENTHS.load(Ordering::Relaxed);
-    let Some(bytes) = pixel_bytes(format).filter(|_| tenths != u32::MAX) else {
-        return;
-    };
-    // About a fortieth of the frame's height a glyph: 6 dots a pixel at
-    // 2160 lines, 3 at 1080.
-    let scale = (height / 360).clamp(2, 12);
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    let made = made.get_or_insert_with(HashMap::new);
-    if made.len() > 2048 {
-        // (Every text is a buffer of a few hundred KiB; a rate that wanders
-        // over thousands of values is not expected.)
-        made.clear();
-    }
-    let key = (tenths, format.0, scale);
-    if let Entry::Vacant(entry) = made.entry(key) {
-        let (w, h, lit) = bitmap(&text(tenths), scale);
-        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
-        let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+
+    /// Records the copy and keeps the upload alive through list completion.
+    pub(crate) fn draw(
+        &mut self,
+        host: &Host,
+        copy: &HostList,
+        back: &ID3D12Resource,
+        (width, height, format): (u32, u32, DXGI_FORMAT),
+    ) {
+        let (Some((fps, ms)), Some(bytes)) = (self.rate, pixel_bytes(format)) else {
             return;
         };
+        let stats = self.stats.then(|| *STATS.lock().unwrap_or_else(|e| e.into_inner()));
+        let display = Display { fps, ms, stats };
+        let scale = (height / 360).clamp(2, 12);
+        let key = (display, format, scale);
+        if self.made.as_ref().is_none_or(|(old, _)| *old != key) {
+            self.made = Made::new(host, &display.text(), format, scale, bytes).map(|made| (key, made));
+        }
+        let Some((_, made)) = self.made.as_ref() else {
+            return;
+        };
+        let margin = 4 * scale;
+        if made.width + 2 * margin > width || made.height + 2 * margin > height {
+            return;
+        }
+        copy.keep(&made.buffer);
+        made.copy_to(&copy.list, back, format, margin);
+    }
+}
+
+impl Made {
+    fn new(host: &Host, text: &str, format: DXGI_FORMAT, scale: u32, bytes: usize) -> Option<Self> {
+        let (w, h, lit) = bitmap(text, scale);
+        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+        let (buffer, data) = host.shared_buffer((pitch * h as usize) as u64)?;
         // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
         let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
         for y in 0..h as usize {
@@ -185,35 +381,41 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
                 pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
             }
         }
-        entry.insert(Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        Some(Self {
+            buffer,
+            width: w,
+            height: h,
+            pitch: pitch as u32,
+        })
     }
-    let Some(m) = made.get(&key) else {
-        return;
-    };
-    let margin = 4 * scale;
-    if m.width + 2 * margin > width || m.height + 2 * margin > height {
-        return;
-    }
-    // SAFETY: an open list; the back buffer is a copy's destination in it
-    // and the box lies inside it; our buffer holds `pitch * height` bytes
-    // and is kept for as long as the process runs.
-    unsafe {
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(&m.buffer),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: m.width, Height: m.height, Depth: 1, RowPitch: m.pitch },
+
+    fn copy_to(&self, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, format: DXGI_FORMAT, margin: u32) {
+        // SAFETY: an open list with the back buffer in copy destination
+        // state. The box fits, and the presenter keeps the source alive.
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&self.buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            Width: self.width,
+                            Height: self.height,
+                            Depth: 1,
+                            RowPitch: self.pitch,
+                        },
+                    },
                 },
-            },
-        };
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(back),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-        };
-        list.CopyTextureRegion(&to, margin, margin, 0, &from, None);
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(back),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.CopyTextureRegion(&to, margin, margin, 0, &from, None);
+        }
     }
 }
 
@@ -222,10 +424,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_text_is_the_rate_to_a_tenth() {
-        assert_eq!(text(103), "10.3 FPS");
-        assert_eq!(text(7), "0.7 FPS");
-        assert_eq!(text(300), "30.0 FPS");
+    fn formats_the_fps_line_and_optional_resource_lines() {
+        let mut display = Display {
+            fps: 600,
+            ms: 167,
+            stats: None,
+        };
+        assert_eq!(display.text(), "FPS 60.0 / 16.7 ms");
+        display.stats = Some(Stats {
+            cpu: Some(125),
+            gpu: None,
+            ram: Some([123, 157]),
+            vram: Some([68, 110]),
+        });
+        let text = display.text();
+        assert_eq!(
+            text,
+            "FPS 60.0 / 16.7 ms\nCPU % 12.5\nGPU % n/a\nRAM 12.3 / 15.7 GB\nVRAM 6.8 / 11.0 GB"
+        );
+        assert!(text.chars().filter(|c| !c.is_whitespace()).all(|c| glyph(c) != [0; 7]));
+    }
+
+    #[test]
+    fn normalizes_cpu_time_by_wall_time_and_all_logical_processors() {
+        let wall = Duration::from_millis(500);
+        assert_eq!(cpu_percent(500_000, wall, 8), Some(12.5));
+        assert_eq!(cpu_percent(4_000_000, wall, 8), Some(100.0));
+        assert_eq!(cpu_percent(0, wall, 8), Some(0.0));
+        assert_eq!(cpu_percent(1, wall, 0), None);
+        assert_eq!(cpu_percent(1, Duration::ZERO, 8), None);
+    }
+
+    #[test]
+    fn rounds_bytes_to_tenths_of_decimal_gigabytes() {
+        assert_eq!(gb_tenths(1_000_000_000), 10);
+        assert_eq!(gb_tenths(1_049_999_999), 10);
+        assert_eq!(gb_tenths(1_050_000_000), 11);
+        assert_eq!(gb_tenths(u64::MAX), 184_467_440_737);
+    }
+
+    #[test]
+    fn the_box_uses_the_widest_line_and_leaves_a_gap() {
+        let (w, h, lit) = bitmap("FPS\nRAM 0", 1);
+        assert_eq!((w, h), (33, 20));
+        let row = |y: usize| &lit[y * w as usize..(y + 1) * w as usize];
+        assert!(row(8).iter().any(|&dot| dot));
+        assert!(row(9).iter().chain(row(10)).all(|&dot| !dot));
+        assert!(row(11).iter().any(|&dot| dot));
     }
 
     #[test]
@@ -236,7 +481,10 @@ mod tests {
         assert_eq!(lit.len(), (w * h) as usize);
         // The pad is box, not text; the "1" has its stem lit.
         assert!(lit[..(w * 6) as usize].iter().all(|&l| !l), "the top pad");
-        assert!((0..h).all(|y| !lit[(y * w) as usize] && !lit[(y * w + w - 1) as usize]), "the side pads");
+        assert!(
+            (0..h).all(|y| !lit[(y * w) as usize] && !lit[(y * w + w - 1) as usize]),
+            "the side pads"
+        );
         let at = |x: u32, y: u32| lit[(y * w + x) as usize];
         // Glyph 0 ("1"): dot column 2 of row 0 is lit, column 0 is not.
         assert!(at(6 + 2 * 3, 6) && !at(6, 6));

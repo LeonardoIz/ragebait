@@ -296,14 +296,29 @@ pub fn thread_times() -> (u64, u64) {
 }
 
 /// The process's processor time so far (user, kernel), in microseconds.
-fn process_times() -> (u64, u64) {
+pub(crate) fn process_times() -> Option<(u64, u64)> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own process and four valid out pointers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
-    (micros(user), micros(kernel))
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
+    (ok != 0).then(|| (micros(user), micros(kernel)))
+}
+
+/// The process's working set and private commit, in bytes.
+pub(crate) fn process_memory() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized extended counter structure.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) };
+    (ok != 0).then_some((c.WorkingSetSize as u64, c.PrivateUsage as u64))
 }
 
 /// The process's page faults so far (soft and hard).
@@ -346,7 +361,7 @@ const S_FREE_MB: usize = 10;
 
 fn sample() -> [u64; S] {
     let (tu, tk) = thread_times();
-    let (pu, pk) = process_times();
+    let (pu, pk) = process_times().unwrap_or_default();
     [
         tu,
         tk,
