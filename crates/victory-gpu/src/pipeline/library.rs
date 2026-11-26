@@ -57,9 +57,41 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on,
+/// unless another process holds the folder (`IN_USE`); this one then goes
+/// without the library.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    if let Err(e) = hold(&dir) {
+        BUSY.store(true, Ordering::Relaxed);
+        tracing::warn!(error = %e, "the pipeline cache folder is in use by another victory process (a run or `victory prebuild`): no pipeline library in this one");
+        return;
+    }
     let _ = DIR.set(dir);
+}
+
+/// Held, opened without sharing, for as long as a process uses the
+/// folder: one run or `victory prebuild` at a time, since both write the
+/// library through the same `.tmp` file. Windows lets go of it when the
+/// process ends, however it ends.
+const IN_USE: &str = "in-use.lock";
+static HELD: OnceLock<std::fs::File> = OnceLock::new();
+/// Whether `use_pipeline_cache` found the folder held by another process.
+pub(crate) static BUSY: AtomicBool = AtomicBool::new(false);
+
+fn hold(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    if HELD.get().is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(dir.join(IN_USE))?;
+    let _ = HELD.set(file);
+    Ok(())
 }
 
 /// The folder `use_pipeline_cache` gave, if any.

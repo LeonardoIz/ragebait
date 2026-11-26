@@ -27,7 +27,9 @@ Converting them ahead of time from files is only a warm-up.
 Host pipelines are kept in the driver's pipeline library under `cache_dir`;
 with `VICTORY_PSO_PREBUILD=1` a run also records the descriptions of the
 pipelines it uses, and `victory prebuild` makes those into the library
-ahead of the next run (`victory-gpu::pipeline::prebuild`).
+ahead of the next run (`victory-gpu::pipeline::prebuild`). One process holds the pipeline
+cache folder at a time (`in-use.lock`): `prebuild` refuses to start while a
+run holds it.
 
 ## Crates
 

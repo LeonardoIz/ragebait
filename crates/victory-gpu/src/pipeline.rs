@@ -111,17 +111,18 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader::new(stage, bytes))
+            Arc::new(Shader::new(stage, bytes, &full))
         })
         .clone()
 }
 
 impl Shader {
-    /// A container of its own (not in the shared table).
-    fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+    /// A container of its own (not in the shared table); `full` is the
+    /// blake3 hash of `bytes`.
+    fn new(stage: &'static str, bytes: &[u8], full: &blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: full.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),

@@ -26,8 +26,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString};
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -36,11 +36,18 @@ use super::{Bytecode, Shader};
 
 const FILE: &str = "pipeline-descriptions.bin";
 const CONTAINERS: &str = "containers";
-const MAGIC: &[u8; 8] = b"VPDESC01";
+/// The file starts with this and the translation settings of the latest
+/// run that recorded into it (`settings`), then holds the descriptions.
+const MAGIC: &[u8; 8] = b"VPDESC02";
+const HEADER: usize = 16;
 /// Descriptions kept, at most (as many as the early list).
 const MAX: usize = 8192;
 /// The input layout subobject.
 const INPUT_LAYOUT: u32 = 12;
+/// Subobjects whose title pointers are zeroed with the rest of their body:
+/// the root signature (0), stream output (7), cached pipeline (19) and view
+/// instancing (22). `GraphicsState::read` and the key never read them.
+const ZEROED: [u32; 4] = [0, 7, 19, 22];
 /// Every stage name a pipeline's shaders carry.
 const STAGES: [&str; 8] = [
     "vertex",
@@ -90,25 +97,26 @@ fn put(bytes: &mut [u8], at: usize, v: u64) {
     bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// The subobjects of `stream` whose pointers are taken out or put back:
-/// where each lies and whether it is a shader (else the input layout).
-fn pointers(stream: &[u8]) -> (Vec<(usize, bool)>, usize) {
+/// The whole subobjects of `stream`: where each lies and its type.
+fn pointers(stream: &[u8]) -> (Vec<(usize, u32)>, usize) {
     let (mut found, mut at) = (Vec::new(), 0);
     while at + 8 <= stream.len() {
         let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
-        let Some((size, stage)) = super::subobject(kind) else {
+        let Some((size, _)) = super::subobject(kind) else {
             break;
         };
         if size > stream.len() - at {
             break;
         }
-        if stage.is_some() || kind == INPUT_LAYOUT {
-            found.push((at, stage.is_some()));
-        }
+        found.push((at, kind));
         at += size;
     }
     // `read_stream` stops where this does: what follows is never read.
     (found, at)
+}
+
+fn is_shader(kind: u32) -> bool {
+    super::subobject(kind).is_some_and(|(_, stage)| stage.is_some())
 }
 
 /// The title's creation stream without its pointers.
@@ -119,7 +127,16 @@ pub(crate) unsafe fn portable(stream: &[u8]) -> Portable {
     let (found, end) = pointers(stream);
     let mut stream = stream[..end].to_vec();
     let mut elements = Vec::new();
-    for (at, shader) in found {
+    for (at, kind) in found {
+        let size = super::subobject(kind).expect("a known size").0;
+        if ZEROED.contains(&kind) {
+            stream[at + 8..at + size].fill(0);
+            continue;
+        }
+        let shader = is_shader(kind);
+        if !shader && kind != INPUT_LAYOUT {
+            continue;
+        }
         let ptr = word(&stream, at + 8);
         if shader {
             if ptr == 0 {
@@ -176,14 +193,14 @@ fn rebuild(p: &Portable, containers: &[Vec<u8>]) -> Option<Rebuilt> {
         .collect();
     let mut stream = p.stream.clone();
     let mut next = containers.iter();
-    for (at, shader) in pointers(&p.stream).0 {
-        if shader {
+    for (at, kind) in pointers(&p.stream).0 {
+        if is_shader(kind) {
             if word(&stream, at + 16) != 0 {
                 let c = next.next()?;
                 put(&mut stream, at + 8, c.as_ptr() as u64);
                 put(&mut stream, at + 16, c.len() as u64);
             }
-        } else {
+        } else if kind == INPUT_LAYOUT {
             let n =
                 u32::from_le_bytes(stream[at + 16..at + 20].try_into().expect("4 bytes")) as usize;
             if n != elements.len() {
@@ -254,16 +271,43 @@ fn decode(mut b: &[u8]) -> Option<Description> {
     .then_some(d)
 }
 
-/// The descriptions in `dir`, each key once; empty if there are none or
-/// the file is of another format. A record cut short (a run that ended
-/// during a write) ends the list.
-fn read_all(dir: &Path) -> Vec<Description> {
+/// What the translation of the shaders depends on besides the translator
+/// itself (the `VICTORY_*` switches set, the host's wave size and view
+/// heap, and the Wave64 lists), hashed: the library names a pre-build
+/// gives are the run's only when this is the run's.
+fn settings() -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&victory_shader::emit::translation_settings());
+    for name in ["VICTORY_WAVE_WIDE_SEEN", "VICTORY_WAVE_WIDE_LIST"] {
+        h.update(name.as_bytes());
+        h.update(std::env::var_os(name).unwrap_or_default().as_encoded_bytes());
+        h.update(&[0]);
+    }
+    h.finalize().as_bytes()[..8].try_into().expect("8 bytes")
+}
+
+/// The translation settings in the header of `dir`'s file, if it has one.
+fn recorded_settings(dir: &Path) -> Option<[u8; 8]> {
+    let mut header = [0u8; HEADER];
+    std::fs::File::open(dir.join(FILE))
+        .and_then(|mut f| f.read_exact(&mut header))
+        .ok()?;
+    header
+        .starts_with(MAGIC)
+        .then(|| header[8..].try_into().expect("8 bytes"))
+}
+
+/// The descriptions in `dir`, each key once, and where the last whole
+/// record ends (0: no file, or one of another format). A record cut short
+/// (a run that ended during a write) ends the list.
+fn read_all(dir: &Path) -> (Vec<Description>, usize) {
     let Ok(bytes) = std::fs::read(dir.join(FILE)) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    let Some(mut rest) = bytes.strip_prefix(MAGIC.as_slice()) else {
-        return Vec::new();
-    };
+    if bytes.len() < HEADER || !bytes.starts_with(MAGIC) {
+        return (Vec::new(), 0);
+    }
+    let mut rest = &bytes[HEADER..];
     let (mut seen, mut all) = (HashSet::new(), Vec::new());
     while let Some(n) = rest
         .get(..4)
@@ -277,7 +321,30 @@ fn read_all(dir: &Path) -> Vec<Description> {
             all.push(d);
         }
     }
-    all
+    (all, bytes.len() - rest.len())
+}
+
+/// The keys `dir` holds. A record cut short is cut off the file, or every
+/// record appended after it would be out of reach for good (and appended
+/// again by every run).
+fn load(dir: &Path) -> HashSet<String> {
+    let (all, end) = read_all(dir);
+    if end > 0 {
+        let cut = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(FILE))
+            .and_then(|f| {
+                if f.metadata()?.len() > end as u64 {
+                    tracing::warn!(end, "pipeline descriptions: a record cut short is cut off");
+                    f.set_len(end as u64)?;
+                }
+                Ok(())
+            });
+        if let Err(e) = cut {
+            tracing::warn!(error = %e, "pipeline descriptions: a record cut short stays");
+        }
+    }
+    all.into_iter().map(|d| d.key).collect()
 }
 
 /// Descriptions of pipelines first used since the last save, with their
@@ -306,49 +373,71 @@ pub(crate) fn note(key: &str, shaders: &[Arc<Shader>], record: Option<&Portable>
 /// Appends the queued descriptions that `dir` does not hold yet; on a
 /// worker, with the library's save.
 pub(crate) fn flush(dir: &Path) {
-    static KNOWN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let queued = std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
-    if queued.is_empty() {
-        return;
+    if !queued.is_empty() {
+        append(dir, queued, settings());
     }
+}
+
+/// Appends those of `queued` that `dir` does not hold yet, the header
+/// saying the translation settings `now`. A key counts as held once it is
+/// written.
+fn append(dir: &Path, queued: Vec<Queued>, now: [u8; 8]) {
+    static KNOWN: Mutex<Option<(PathBuf, HashSet<String>)>> = Mutex::new(None);
+    static FULL: std::sync::Once = std::sync::Once::new();
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    let known = known.get_or_insert_with(|| read_all(dir).into_iter().map(|d| d.key).collect());
-    let mut out = Vec::new();
+    if known.as_ref().is_none_or(|(d, _)| d != dir) {
+        *known = Some((dir.to_owned(), load(dir)));
+    }
+    let known = &mut known.as_mut().expect("just set").1;
+    let (mut out, mut keys) = (Vec::new(), HashSet::new());
     for (d, shaders) in queued {
-        if known.len() >= MAX || known.contains(&d.key) {
+        if known.len() + keys.len() >= MAX {
+            FULL.call_once(|| {
+                tracing::warn!(MAX, "pipeline descriptions: the file is full, no more are recorded (said once)");
+            });
+            break;
+        }
+        if known.contains(&d.key) || keys.contains(&d.key) {
             continue;
         }
-        for s in &shaders {
-            if let Err(e) = keep_container(dir, s) {
-                tracing::warn!(error = %e, "pipeline description not recorded");
-                return;
-            }
+        if let Err(e) = shaders.iter().try_for_each(|s| keep_container(dir, s)) {
+            tracing::warn!(error = %e, "pipeline description not recorded");
+            continue;
         }
         let body = encode(&d);
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
         out.extend_from_slice(&body);
-        known.insert(d.key);
+        keys.insert(d.key);
     }
     if out.is_empty() {
         return;
     }
-    let path = dir.join(FILE);
     let written = (|| {
-        // A file of another format is started again.
-        let fresh = std::fs::read(&path).map_or(true, |b| !b.starts_with(MAGIC));
         let mut file = std::fs::OpenOptions::new()
             .create(true)
-            .append(!fresh)
+            .truncate(false)
+            .read(true)
             .write(true)
-            .truncate(fresh)
-            .open(&path)?;
-        if fresh {
-            file.write_all(MAGIC)?;
+            .open(dir.join(FILE))?;
+        let mut header = [0u8; HEADER];
+        let whole = file.read_exact(&mut header).is_ok() && header.starts_with(MAGIC);
+        if !whole {
+            // A file of another format is started again.
+            file.set_len(0)?;
         }
+        if !whole || header[8..] != now {
+            // The latest run's settings: what a pre-build is for.
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(MAGIC)?;
+            file.write_all(&now)?;
+        }
+        file.seek(SeekFrom::End(0))?;
         file.write_all(&out)
     })();
-    if let Err(e) = written {
-        tracing::warn!(error = %e, "pipeline descriptions not recorded");
+    match written {
+        Ok(()) => known.extend(keys),
+        Err(e) => tracing::warn!(error = %e, "pipeline descriptions not recorded"),
     }
 }
 
@@ -362,6 +451,11 @@ fn keep_container(dir: &Path, s: &Shader) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &s.container)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// A container of its own (the pre-build keeps none in the shared table).
+fn own(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    Arc::new(Shader::new(stage, bytes, &blake3::hash(bytes)))
 }
 
 /// A description's shaders (of their own, so the pre-build keeps no
@@ -380,10 +474,7 @@ fn replay(
     let (shaders, graphics) = if d.portable.stream.is_empty() {
         let shaders = (d.shaders.iter().zip(&containers))
             .map(|((stage, _), c)| {
-                Some(Arc::new(Shader::new(
-                    STAGES.iter().find(|s| *s == stage)?,
-                    c,
-                )))
+                Some(own(STAGES.iter().find(|s| *s == stage)?, c))
             })
             .collect::<Option<Vec<_>>>()
             .ok_or("unknown stage")?;
@@ -394,11 +485,8 @@ fn replay(
         let mut g = GraphicsState::default();
         let own = |stage, code: &Bytecode| {
             // SAFETY: the code points into `containers`.
-            (!code.code.is_null() && code.size != 0).then(|| {
-                Arc::new(Shader::new(stage, unsafe {
-                    std::slice::from_raw_parts(code.code, code.size)
-                }))
-            })
+            (!code.code.is_null() && code.size != 0)
+                .then(|| own(stage, unsafe { std::slice::from_raw_parts(code.code, code.size) }))
         };
         // SAFETY: a whole subobject lies at `at`, its pointers at `rebuilt`'s own data.
         let shaders =
@@ -416,12 +504,27 @@ fn replay(
 /// summary line. A pipeline that cannot be made is counted, never fatal.
 pub(crate) fn run(threads: usize) -> Result<String, String> {
     let started = std::time::Instant::now();
+    if super::library::BUSY.load(Ordering::Relaxed) {
+        return Err("the pipeline cache folder is in use by a running game (or another prebuild): close it first".into());
+    }
     let dir =
         super::library::dir().ok_or("no pipeline cache folder (cache_dir in victory.toml)")?;
     crate::host::host().ok_or("no host D3D12 device")?;
+    // The host facts the translation reads, as a run's first shader has them.
+    crate::descriptor::host::probe_view_limit();
+    let mismatch = recorded_settings(dir).is_some_and(|r| r != settings());
+    if mismatch {
+        tracing::warn!(
+            "pipeline prebuild: the translation settings (VICTORY_* shader switches, host wave size, view heap) differ from the recording run's; the run finds these pipelines only if started with this environment"
+        );
+    }
     // Read now, so the library's save keeps the early list as it is.
     super::library::wanted_early("");
-    let all = read_all(dir);
+    let all = read_all(dir).0;
+    // A save writes the whole library (up to 1.35 GB): every few minutes
+    // and at the end, not every 20 s.
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+    let last_save = Mutex::new(std::time::Instant::now());
     let (next, made, loaded) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let failed: Mutex<BTreeMap<&str, u64>> = Mutex::new(BTreeMap::new());
     // Without a run's log lines per shader and pipeline: thousands of them.
@@ -453,7 +556,17 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
                                 .or_default() += 1
                         }
                     }
-                    super::library::save(false);
+                    let due = {
+                        let mut t = last_save.lock().unwrap_or_else(|e| e.into_inner());
+                        let due = t.elapsed() >= SAVE_EVERY;
+                        if due {
+                            *t = std::time::Instant::now();
+                        }
+                        due
+                    };
+                    if due {
+                        super::library::save(true);
+                    }
                 }
             });
         }
@@ -461,12 +574,17 @@ pub(crate) fn run(threads: usize) -> Result<String, String> {
     super::library::save(true);
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     let summary = format!(
-        "pipeline prebuild: {} recorded, prebuilt {}, loaded from cache {}, failed {}, {:.1} s",
+        "pipeline prebuild: {} recorded, prebuilt {}, loaded from cache {}, failed {}, {:.1} s{}",
         all.len(),
         made.into_inner(),
         loaded.into_inner(),
         failed.values().sum::<u64>(),
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        if mismatch {
+            "; WARNING: translation settings differ from the recording run's"
+        } else {
+            ""
+        }
     );
     tracing::info!(?failed, "{summary}");
     Ok(summary)
@@ -499,9 +617,9 @@ mod tests {
         let mut g = GraphicsState::default();
         let own = |stage, code: &Bytecode| {
             // SAFETY: the test's live code.
-            Some(Arc::new(Shader::new(stage, unsafe {
+            Some(own(stage, unsafe {
                 std::slice::from_raw_parts(code.code, code.size)
-            })))
+            }))
         };
         // SAFETY: whole subobjects with live pointers.
         let shaders =
@@ -545,13 +663,9 @@ mod tests {
 
         // Written and read back with the containers: the run's key again.
         let dir = tempfile::tempdir().unwrap();
-        let shaders = [
-            Arc::new(Shader::new("vertex", &vs)),
-            Arc::new(Shader::new("pixel", &ps)),
-        ];
-        note(&d.key, &shaders, Some(&d.portable));
-        flush(dir.path());
-        let all = read_all(dir.path());
+        let shaders = vec![own("vertex", &vs), own("pixel", &ps)];
+        append(dir.path(), vec![(d, shaders)], [1; 8]);
+        let (all, _) = read_all(dir.path());
         assert_eq!(all, vec![description(&s, &vs, &ps)]);
         let (again, graphics) = replay(dir.path(), &all[0]).unwrap();
         assert_eq!(
@@ -564,7 +678,51 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.extend_from_slice(&100u32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read_all(dir.path()).len(), 1);
+        assert_eq!(read_all(dir.path()).0.len(), 1);
+    }
+
+    /// A record cut short is cut off when the keys are first read, so the
+    /// records appended later are read back.
+    #[test]
+    fn a_record_cut_short_is_cut_off() {
+        let (vs, ps) = (vec![3u8; 8], vec![4u8; 8]);
+        let shaders = || vec![own("vertex", &vs), own("pixel", &ps)];
+        let (a, b) = (stream(&vs, &ps, &[], 3), stream(&vs, &ps, &[], 2));
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), vec![(description(&a, &vs, &ps), shaders())], [1; 8]);
+        let path = dir.path().join(FILE);
+        let whole = std::fs::read(&path).unwrap();
+        let mut torn = whole.clone();
+        torn.extend_from_slice(&500u32.to_le_bytes());
+        torn.extend_from_slice(&[9; 20]);
+        std::fs::write(&path, &torn).unwrap();
+        assert_eq!(load(dir.path()).len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), whole);
+        // Torn again, and another folder in between, so that `append`
+        // reads this one's keys afresh as a new run would.
+        std::fs::write(&path, &torn).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        append(other.path(), vec![(description(&a, &vs, &ps), shaders())], [1; 8]);
+        append(dir.path(), vec![(description(&b, &vs, &ps), shaders())], [1; 8]);
+        let keys: Vec<String> = read_all(dir.path()).0.into_iter().map(|d| d.key).collect();
+        assert_eq!(keys, [title_key(&a), title_key(&b)]);
+    }
+
+    /// The header keeps the latest recording run's translation settings,
+    /// which a pre-build compares with its own; the records stay.
+    #[test]
+    fn the_header_tells_other_translation_settings() {
+        let (vs, ps) = (vec![6u8; 8], vec![8u8; 8]);
+        let shaders = || vec![own("vertex", &vs), own("pixel", &ps)];
+        let (a, b) = (stream(&vs, &ps, &[], 3), stream(&vs, &ps, &[], 1));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_settings(dir.path()), None);
+        append(dir.path(), vec![(description(&a, &vs, &ps), shaders())], [1; 8]);
+        assert_eq!(recorded_settings(dir.path()), Some([1; 8]));
+        append(dir.path(), vec![(description(&b, &vs, &ps), shaders())], [2; 8]);
+        assert_eq!(recorded_settings(dir.path()), Some([2; 8]));
+        assert_eq!(read_all(dir.path()).0.len(), 2);
+        assert_eq!(settings(), settings());
     }
 
     /// The key depends on what the pipeline is, not where the title kept

@@ -217,6 +217,29 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
+/// What of [`translation_fingerprint`] the run's environment and host
+/// decide, not the translator's source: the `VICTORY_*` switches it reads
+/// that are set, and the host facts and settings. Equal for two processes
+/// of one build or of two builds that read the same switches, so it tells
+/// whether two runs translate alike. Call it after the device is made.
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::new();
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(name.as_bytes());
+            out.push(b'=');
+            out.extend_from_slice(value.as_encoded_bytes());
+            out.push(0);
+        }
+    }
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.push(group_sync());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {

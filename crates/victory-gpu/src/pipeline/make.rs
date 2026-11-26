@@ -33,8 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// Its creation description for the pre-build, kept until its first
-    /// use (`VICTORY_PSO_PREBUILD=1`, see `prebuild`).
+    /// Its creation description for the pre-build, kept as long as this
+    /// pipeline (`VICTORY_PSO_PREBUILD=1`, see `prebuild`).
     pub(crate) record: Option<super::prebuild::Portable>,
 }
 
