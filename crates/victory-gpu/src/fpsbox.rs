@@ -199,19 +199,20 @@ impl Display {
             format!("{}.{}", tenths / 10, tenths % 10)
         }
 
+        let Some(stats) = self.stats else {
+            return format!("{} FPS", decimal(self.fps.into()));
+        };
         let mut text = format!("FPS {} / {} ms", decimal(self.fps.into()), decimal(self.ms.into()));
-        if let Some(stats) = self.stats {
-            for (label, value) in [("CPU %", stats.cpu), ("GPU %", stats.gpu)] {
-                let value = value.map_or_else(|| "n/a".into(), |v| decimal(v.into()));
-                let _ = write!(text, "\n{label} {value}");
-            }
-            for (label, value) in [("RAM", stats.ram), ("VRAM", stats.vram)] {
-                let value = value.map_or_else(
-                    || "n/a".into(),
-                    |[used, limit]| format!("{} / {} GB", decimal(used), decimal(limit)),
-                );
-                let _ = write!(text, "\n{label} {value}");
-            }
+        for (label, value) in [("CPU %", stats.cpu), ("GPU %", stats.gpu)] {
+            let value = value.map_or_else(|| "n/a".into(), |v| decimal(v.into()));
+            let _ = write!(text, "\n{label} {value}");
+        }
+        for (label, value) in [("RAM", stats.ram), ("VRAM", stats.vram)] {
+            let value = value.map_or_else(
+                || "n/a".into(),
+                |[used, limit]| format!("{} / {} GB", decimal(used), decimal(limit)),
+            );
+            let _ = write!(text, "\n{label} {value}");
         }
         text
     }
@@ -345,7 +346,8 @@ impl Overlay {
     /// Updates the rate from the presenter's one-second meter.
     pub(crate) fn set_rate(&mut self, fps: f64, ms: f64) {
         if self.on {
-            self.rate = Some((tenths(fps).min(99_999), tenths(ms)));
+            let ms = if self.stats { tenths(ms) } else { 0 };
+            self.rate = Some((tenths(fps).min(99_999), ms));
         }
     }
 
@@ -454,19 +456,30 @@ mod tests {
     }
 
     #[test]
-    fn formats_the_fps_line_and_optional_resource_lines() {
-        let mut display = Display {
+    fn fps_only_uses_the_original_text_and_box_size() {
+        let display = Display {
             fps: 600,
             ms: 167,
             stats: None,
         };
-        assert_eq!(display.text(), "FPS 60.0 / 16.7 ms");
-        display.stats = Some(Stats {
-            cpu: Some(125),
-            gpu: None,
-            ram: Some([123, 157]),
-            vram: Some([68, 110]),
-        });
+        let text = display.text();
+        assert_eq!(text, "60.0 FPS");
+        let (width, height, _) = bitmap(&text, 2);
+        assert_eq!((width, height), (102, 22));
+    }
+
+    #[test]
+    fn formats_the_frame_time_and_resource_lines() {
+        let display = Display {
+            fps: 600,
+            ms: 167,
+            stats: Some(Stats {
+                cpu: Some(125),
+                gpu: None,
+                ram: Some([123, 157]),
+                vram: Some([68, 110]),
+            }),
+        };
         let text = display.text();
         assert_eq!(
             text,
