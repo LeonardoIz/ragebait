@@ -2658,8 +2658,9 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
-/// Whether the host supports typed unordered views of this format.
-fn typed_store(format: u32) -> bool {
+/// Whether the host supports typed unordered views of this format that
+/// shaders store to; asked once per format.
+pub(crate) fn typed_store(format: u32) -> bool {
     static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, supported)) = known.iter().find(|&&(f, _)| f == format) {
@@ -2680,6 +2681,7 @@ fn typed_store(format: u32) -> bool {
         }
         .is_ok()
             && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+            && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0
     });
     known.push((format, supported));
     supported
@@ -2766,7 +2768,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            // The extent the descriptor exposes is what the copy must hold.
+            let extent = constant_view_size(size);
+            let shadow = crate::shadow::find(address, u64::from(extent))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -2786,7 +2790,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_view_size(size),
+                SizeInBytes: extent,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
