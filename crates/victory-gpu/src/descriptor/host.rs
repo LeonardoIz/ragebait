@@ -121,7 +121,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
+    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps (or
+    /// `VICTORY_DYNAMIC_SLOTS` on a capped host heap), none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
@@ -1180,6 +1181,31 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The fewest title slots a capped host heap keeps, however many dynamic
+/// slots `VICTORY_DYNAMIC_SLOTS` asks for ([`capped_dynamic_slots`]).
+const LEAST_TITLE: u32 = 1 << 16;
+
+/// `VICTORY_DYNAMIC_SLOTS=<n>`: the dynamic slots of a view heap that a
+/// host heap capped below [`PORTABLE_VIEWS`] (NVIDIA) does not hold whole
+/// with [`DYNAMIC`] more. Unset: [`DYNAMIC`], as before. More dynamic slots
+/// come out of the title's upper slots, which then have no host slot (a
+/// table reaching there is made afresh for its draw, like any past the
+/// title's slots); worth it when those upper slots are a ring of per-draw
+/// tables and the dynamic ring runs dry (after victory-fork PR #1258, whose
+/// measured default is not taken here: set it from a measurement).
+fn dynamic_slots_set() -> Option<u32> {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The dynamic slots of a capped host view heap whose null slot is `null`,
+/// for `set` ([`dynamic_slots_set`]): at least [`DYNAMIC`], and leaving the
+/// title [`LEAST_TITLE`] slots.
+fn capped_dynamic_slots(null: u32, set: Option<u32>) -> u32 {
+    let most = null.saturating_sub(LEAST_TITLE).max(DYNAMIC);
+    set.unwrap_or(DYNAMIC).clamp(DYNAMIC, most)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1211,6 +1237,11 @@ impl HostHeap {
             0
         } else {
             victory_shader::emit::view_heap_limit()
+        };
+        let extra = if null != 0 && null < PORTABLE_VIEWS && count + extra > null {
+            capped_dynamic_slots(null, dynamic_slots_set())
+        } else {
+            extra
         };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
@@ -1284,8 +1315,8 @@ impl HostHeap {
                 .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
                 .collect(),
             kept_one: Mutex::new(()),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count),
@@ -1454,7 +1485,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -5130,6 +5161,19 @@ mod tests {
         heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// `VICTORY_DYNAMIC_SLOTS` on a capped heap: unset keeps [`DYNAMIC`],
+    /// and a set count is no fewer than that and leaves the title
+    /// [`LEAST_TITLE`] slots.
+    #[test]
+    fn a_capped_heap_takes_the_dynamic_slots_asked_for_within_bounds() {
+        let null = PORTABLE_VIEWS - 1;
+        assert_eq!(capped_dynamic_slots(null, None), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(null, Some(500_000)), 500_000);
+        assert_eq!(capped_dynamic_slots(null, Some(10)), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(null, Some(u32::MAX)), null - LEAST_TITLE);
+        assert_eq!(capped_dynamic_slots(DYNAMIC, Some(u32::MAX)), DYNAMIC, "a tiny heap keeps the old count");
     }
 }
 
