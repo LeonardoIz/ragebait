@@ -72,6 +72,16 @@ clear the switch with `Remove-Item Env:VICTORY_PSO_PREBUILD`, and run
 `target\release\victory.exe prebuild --jobs 4`. Then play normally. Rerun
 prebuild after a driver or translator change.
 
+`target\release\victory.exe precompile` does both steps (warm-up of every
+shader under the game folder, then prebuild of the recorded pipelines), each
+only when the translator, its switches, the GPU driver, the folder or the
+recorded pipelines changed since it last ran. With
+`$env:VICTORY_AUTO_PRECOMPILE = '1'`, `victory run --execute` runs it before
+the title starts (in its own process, so its memory is freed first) and keeps
+recording pipelines, so the next start prebuilds what the last run added.
+The first start warms every shader and can take many minutes;
+`VICTORY_WARM_SECONDS=<n>` caps the warm-up, and the next start continues it.
+
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `VICTORY_STATS` | On | Show resource statistics in the FPS overlay |
@@ -96,6 +106,7 @@ prebuild after a driver or translator change.
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
 | `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |
+| `VICTORY_AUTO_PRECOMPILE=1` | Off | `run --execute` first runs `victory precompile` when the caches are stale, and records pipelines for the next start |
 
 The best switch set measured so far is in
 [diagnostics/README.md](diagnostics/README.md). Each `VICTORY_*` switch is

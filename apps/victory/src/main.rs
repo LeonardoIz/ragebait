@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -102,6 +103,21 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Warm the shader cache with every container under the paths (default:
+    /// the configured game) and make the recorded title pipelines into the
+    /// pipeline library, each only when what it was last done for (the
+    /// translator and its settings, the host's adapter and driver, the
+    /// paths, the recorded pipelines) changed. `victory run --execute`
+    /// does this first with `VICTORY_AUTO_PRECOMPILE=1`.
+    Precompile {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: half the logical cores, 2 to 8).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Do both steps even if the cache is up to date.
+        #[arg(long)]
+        force: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -180,20 +196,18 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs).map(drop);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Prebuild { jobs } => {
             let cfg = victory_core::Config::load()?;
             victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-            let threads = jobs.unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
-            });
-            let summary = victory_hle::modules::d3d12x::prebuild_pipelines(threads).map_err(anyhow::Error::msg)?;
+            let summary = victory_hle::modules::d3d12x::prebuild_pipelines(default_threads(jobs)).map_err(anyhow::Error::msg)?;
             println!("{summary}");
             Ok(())
         }
+        Command::Precompile { paths, jobs, force } => precompile::run(paths, jobs, force),
         Command::Run {
             exe,
             unimplemented,
@@ -236,6 +250,11 @@ fn show_config() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--jobs`, else half the logical cores, 2 to 8 (`prebuild`, `precompile`).
+pub(crate) fn default_threads(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
 }
 
 /// Paths given on the command line, or the configured game + test titles.

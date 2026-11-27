@@ -274,7 +274,7 @@ fn decode(mut b: &[u8]) -> Option<Description> {
 /// itself (the `VICTORY_*` switches set, the host's wave size and view
 /// heap, and the Wave64 lists), hashed: the library names a pre-build
 /// gives are the run's only when this is the run's.
-fn settings() -> [u8; 8] {
+pub(super) fn settings() -> [u8; 8] {
     let mut h = blake3::Hasher::new();
     h.update(&victory_shader::emit::translation_settings());
     for name in ["VICTORY_WAVE_WIDE_SEEN", "VICTORY_WAVE_WIDE_LIST"] {
@@ -407,8 +407,10 @@ pub(crate) fn note(key: &str, shaders: &[Arc<Shader>], record: Option<&Portable>
 
 /// Starts the writer once the process holds the cache folder.
 pub(crate) fn start(dir: &'static Path) {
-    // VICTORY_PSO_PREBUILD=1 records descriptions and shader containers.
-    if std::env::var_os("VICTORY_PSO_PREBUILD").is_none_or(|v| v != "1") {
+    // VICTORY_PSO_PREBUILD=1 records descriptions and shader containers;
+    // VICTORY_AUTO_PRECOMPILE=1 too, for the next run's automatic pre-build.
+    let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
+    if !on("VICTORY_PSO_PREBUILD") && !on("VICTORY_AUTO_PRECOMPILE") {
         return;
     }
     let (stop, wake) = mpsc::channel();

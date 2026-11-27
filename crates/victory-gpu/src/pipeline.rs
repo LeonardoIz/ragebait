@@ -872,6 +872,21 @@ pub fn prebuild_pipelines(threads: usize) -> Result<String, String> {
     prebuild::run(threads)
 }
 
+/// What a precompiled cache is valid for (`victory precompile`): the
+/// shader cache key with the host facts a run's device gives, the
+/// pre-build's translation settings, and the adapter and driver; hex.
+/// Makes the host device, as a run does.
+#[cfg(windows)]
+pub fn precompile_key() -> Result<String, String> {
+    let host = crate::host::host().ok_or("no host D3D12 device")?;
+    crate::descriptor::host::probe_view_limit();
+    let mut h = blake3::Hasher::new();
+    h.update(&crate::shader_cache::key());
+    h.update(&prebuild::settings());
+    h.update(host.driver().unwrap_or_default().as_bytes());
+    Ok(h.finalize().to_hex()[..32].to_owned())
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]

@@ -156,7 +156,8 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+/// `Ok(false)`: stopped at `VICTORY_WARM_SECONDS` with shaders left.
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<bool> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -224,13 +225,14 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
     let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
-    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
+    let complete = counts[3].load(Ordering::Relaxed) == 0;
+    let stopped = if complete { "" } else { " (stopped at the time limit)" };
     println!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(complete)
 }
 
 pub fn run(

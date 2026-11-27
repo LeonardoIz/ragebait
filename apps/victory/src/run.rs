@@ -4,6 +4,18 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Runs `victory precompile <title_dir>` and waits; a failure is said, never fatal.
+#[cfg(windows)]
+fn precompile(title_dir: &Path) {
+    let status = std::env::current_exe()
+        .and_then(|me| std::process::Command::new(me).arg("precompile").arg(title_dir).status());
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("precompile     failed ({s}); the title starts anyway"),
+        Err(e) => println!("precompile     not started ({e}); the title starts anyway"),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -19,6 +31,13 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // VICTORY_AUTO_PRECOMPILE=1: before the title starts, `victory precompile`
+    // warms the shader cache and pre-builds the recorded pipelines if what they
+    // were made for changed, in a process of its own (its memory is gone before
+    // the title's), and the run records new pipelines for the next one.
+    if execute && std::env::var_os("VICTORY_AUTO_PRECOMPILE").is_some_and(|v| v == "1") {
+        precompile(exe.parent().unwrap_or(Path::new(".")));
+    }
     let prepared = victory_loader::prepare(
         &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;

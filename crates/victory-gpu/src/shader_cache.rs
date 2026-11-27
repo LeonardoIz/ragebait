@@ -78,6 +78,12 @@ fn build(wave_wide: bool) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The translation key for shaders outside the Wave64 lists, as this
+/// process translates now (`victory precompile`'s stamp).
+pub(crate) fn key() -> [u8; 32] {
+    build(false)
+}
+
 // Wave64 compute shaders that ran with wave-wide branches on a 32-lane host
 // in victory-fork #1248. Keep 369cbe906ea72764 out of the defaults because
 // it stalled the GPU. 5dc3b25986622949 and 6f225b641c5b0708 caused water artifacts.

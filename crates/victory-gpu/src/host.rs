@@ -9911,6 +9911,18 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The adapter (vendor and device id) and its user-mode driver
+    /// version, which a pipeline library is valid for (`victory precompile`).
+    pub(crate) fn driver(&self) -> Option<String> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: plain adapter queries that fill our values.
+        unsafe {
+            let desc = adapter.GetDesc1().ok()?;
+            let umd = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+            Some(format!("{:04x}:{:04x}:{umd:x}", desc.VendorId, desc.DeviceId))
+        }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

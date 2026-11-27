@@ -52,6 +52,18 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// What a precompiled cache is valid for: see `victory_gpu::pipeline::precompile_key`.
+pub fn precompile_key() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::precompile_key()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("no host pipelines on this host".into())
+    }
+}
+
 /// The offline pipeline pre-build: see `victory_gpu::pipeline::prebuild_pipelines`.
 pub fn prebuild_pipelines(threads: usize) -> Result<String, String> {
     #[cfg(windows)]

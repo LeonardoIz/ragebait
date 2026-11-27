@@ -29,7 +29,11 @@ with `VICTORY_PSO_PREBUILD=1` a run also records the descriptions of the
 pipelines it uses, and `victory prebuild` makes those into the library
 ahead of the next run (`victory-gpu::pipeline::prebuild`). One process holds the pipeline
 cache folder at a time (`in-use.lock`): `prebuild` refuses to start while a
-run holds it.
+run holds it. `victory precompile` does the warm-up and the pre-build, each
+only when a stamp (`precompile.txt` under `cache_dir`: translator key with
+host facts, adapter and driver, warmed paths, recorded size) no longer
+holds; with `VICTORY_AUTO_PRECOMPILE=1`, `victory run --execute` runs it as a
+child process before the title starts and records pipelines for the next one.
 
 ## Crates
 
