@@ -1063,8 +1063,12 @@ fn reset_in(physical: &Physical, base: usize, len: usize) {
 /// within one call before applying them: one unmapping pass over each run
 /// of destination pages (a view is taken away once, not cut again page
 /// after page), then one view per run of consecutive slices of one section
-/// ([`map_run`], so fewer views to take away later), under one remapping
-/// lock per run. Pages that show what they are to show already are only
+/// within one mapping ([`map_run`]), under one remapping lock per run. A
+/// view never spans two mappings (two scatter addresses, two ranges of a
+/// copy): the title remaps them apart later, and taking a page from a
+/// joined view takes the whole view away and maps the rest again, leaving
+/// pages it never asked to change reserved for a moment while its threads
+/// and the disk workers use them (the crashes of the first A/B round). Pages that show what they are to show already are only
 /// [`reset_in`], as with `VICTORY_MAP_RUNS`. Nothing is deferred past the
 /// call: the title, and the next submission, see every mapping when it
 /// returns. Off by default, for A/B runs with `VICTORY_REMAP_STATS=1`
@@ -1104,10 +1108,16 @@ enum Step {
 }
 
 /// A joined run's steps `(first, end, step)` from what each page is to
-/// show (`wanted`, by [`Slice::key`], `None` for nothing) and whether it
-/// does already (`same`).
-fn batch_plan(wanted: &[Option<(usize, usize)>], same: &[bool]) -> Vec<(usize, usize, Step)> {
+/// show (`wanted`, by [`Slice::key`], `None` for nothing), whether it
+/// does already (`same`) and the pages where each mapping begins
+/// (`starts`, ascending: no `Map` step crosses one).
+fn batch_plan(
+    wanted: &[Option<(usize, usize)>],
+    same: &[bool],
+    starts: &[usize],
+) -> Vec<(usize, usize, Step)> {
     let follows = |k: usize| match (wanted[k - 1], wanted[k]) {
+        _ if starts.binary_search(&k).is_ok() => false,
         (Some(a), Some(b)) => a.0 == b.0 && b.1 == a.1 + 1,
         _ => false,
     };
@@ -1140,8 +1150,14 @@ fn batch_plan(wanted: &[Option<(usize, usize)>], same: &[bool]) -> Vec<(usize, u
 }
 
 /// Applies a joined run from `base` (what each page is to show) under the
-/// remapping lock, as one observed call; empties `wanted`.
-fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) -> bool {
+/// remapping lock, as one observed call; empties `wanted` and `starts`
+/// (the pages where each mapping begins).
+fn flush(
+    physical: &mut Physical,
+    base: usize,
+    wanted: &mut Vec<Option<Slice>>,
+    starts: &mut Vec<usize>,
+) -> bool {
     if wanted.is_empty() {
         return true;
     }
@@ -1158,7 +1174,7 @@ fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) 
             .enumerate()
             .map(|(k, w)| slice_at(&physical.views, base + k * PAGE).map(|s| s.key(0)) == *w)
             .collect();
-        for (first, end, step) in batch_plan(&keys, &same) {
+        for (first, end, step) in batch_plan(&keys, &same, starts) {
             let (at, bytes) = (base + first * PAGE, (end - first) * PAGE);
             match step {
                 Step::Same => {
@@ -1181,6 +1197,7 @@ fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) 
         true
     });
     wanted.clear();
+    starts.clear();
     ok
 }
 
@@ -1194,7 +1211,7 @@ fn flush(physical: &mut Physical, base: usize, wanted: &mut Vec<Option<Slice>>) 
 pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
     let mut guard = physical();
     let physical = &mut *guard;
-    let (mut ok, mut base, mut wanted) = (true, 0, Vec::new());
+    let (mut ok, mut base, mut wanted, mut starts) = (true, 0, Vec::new(), Vec::new());
     for &(to, from, len, repeat) in ops {
         let (to, from, len) = (to as usize, from as usize, len as usize);
         if len == 0 {
@@ -1202,7 +1219,7 @@ pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
         }
         let end = base + wanted.len() * PAGE;
         if !wanted.is_empty() && !joins(base, end, to, from, len, repeat) {
-            ok &= flush(physical, base, &mut wanted);
+            ok &= flush(physical, base, &mut wanted, &mut starts);
         }
         if wanted.is_empty() {
             if !joins(to, to, to, from, len, repeat) {
@@ -1218,6 +1235,7 @@ pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
             }
             base = to;
         }
+        starts.push(wanted.len());
         let pages = len / PAGE;
         if from == 0 {
             wanted.resize(wanted.len() + pages, None);
@@ -1241,11 +1259,11 @@ pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
             wanted.resize(wanted.len() + missing, None);
         }
     }
-    ok & flush(physical, base, &mut wanted)
+    ok & flush(physical, base, &mut wanted, &mut starts)
 }
 
 /// [`XMemMapPhysicalPagesScatter`] with [`remap_batch`]: neighbouring
-/// addresses joined. An unknown page ends the call as it would one after
+/// addresses joined under one remapping lock, a view each. An unknown page ends the call as it would one after
 /// another (that address unmapped, those after it left alone).
 // shortcut: a host failure to map (commit limit) inside a joined run also
 // unmaps that run's later addresses, which one after another would stay as
@@ -1253,7 +1271,7 @@ pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
 fn scatter_batched(addresses: *const *mut c_void, n: usize, pages: *const usize) -> BOOL {
     let mut guard = physical();
     let physical = &mut *guard;
-    let (mut base, mut wanted) = (0, Vec::new());
+    let (mut base, mut wanted, mut starts) = (0, Vec::new(), Vec::new());
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (at, page) = unsafe {
@@ -1275,7 +1293,7 @@ fn scatter_batched(addresses: *const *mut c_void, n: usize, pages: *const usize)
         let end = base + wanted.len() * PAGE;
         if !wanted.is_empty()
             && (slice.is_none() || !joins(base, end, at, 0, PAGE, false))
-            && !flush(physical, base, &mut wanted)
+            && !flush(physical, base, &mut wanted, &mut starts)
         {
             return 0;
         }
@@ -1292,9 +1310,10 @@ fn scatter_batched(addresses: *const *mut c_void, n: usize, pages: *const usize)
             }
             base = at;
         }
+        starts.push(wanted.len());
         wanted.push(slice);
     }
-    BOOL::from(flush(physical, base, &mut wanted))
+    BOOL::from(flush(physical, base, &mut wanted, &mut starts))
 }
 
 /// Maps `pages` slices from `slice` on at `base`, where only placeholders
@@ -2205,7 +2224,7 @@ mod tests {
         ];
         let same = [true, false, false, false, false, false, true];
         assert_eq!(
-            batch_plan(&wanted, &same),
+            batch_plan(&wanted, &same, &[0]),
             [
                 (0, 1, Step::Same),
                 (1, 6, Step::Clear),
@@ -2215,7 +2234,20 @@ mod tests {
                 (6, 7, Step::Same),
             ]
         );
-        assert_eq!(batch_plan(&[], &[]), []);
+        // No view spans two mappings, even of consecutive slices: the
+        // title remaps them apart, and cutting a joined view would leave
+        // the other mapping's pages reserved for a moment.
+        let wanted = [Some((a, 0)), Some((a, 1)), Some((a, 2)), Some((a, 3))];
+        assert_eq!(
+            batch_plan(&wanted, &[false; 4], &[0, 2, 3]),
+            [
+                (0, 4, Step::Clear),
+                (0, 2, Step::Map),
+                (2, 3, Step::Map),
+                (3, 4, Step::Map),
+            ]
+        );
+        assert_eq!(batch_plan(&[], &[], &[]), []);
     }
 
     /// `VICTORY_REMAP_BATCH` on real views: a page-mapping copy leaves
@@ -2236,8 +2268,8 @@ mod tests {
         // SAFETY: read only while mapped.
         let shows = |at: usize| unsafe { (at as *const u8).read() };
         let (p, a, b) = (PAGE as u64, a as u64, b as u64);
-        // Two copies of consecutive pool pages become one view; a repeated
-        // page is a view per page.
+        // Two copies of consecutive pool pages stay two views (the title
+        // remaps them apart); a repeated page is a view per page.
         assert!(map_aliases(&[
             (b, a, 2 * p, false),
             (b + 2 * p, a + 2 * p, 2 * p, false),
@@ -2245,12 +2277,12 @@ mod tests {
         ]));
         let (b, a) = (b as usize, a as usize);
         assert_eq!(
-            (view(b), view(b + 4 * PAGE), view(b + 5 * PAGE)),
-            (Some(4), Some(1), Some(1))
+            (view(b), view(b + 2 * PAGE), view(b + 4 * PAGE), view(b + 5 * PAGE)),
+            (Some(2), Some(2), Some(1), Some(1))
         );
         let got: Vec<u8> = (0..6).map(|k| shows(b + k * PAGE)).collect();
         assert_eq!(got, [60, 61, 62, 63, 60, 60]);
-        // Unmapping the middle cuts the view once; a mapping that reads a
+        // Unmapping the middle cuts the views there once; a mapping that reads a
         // page the run before it changes reads it after that change.
         let (p, a64, b64) = (PAGE as u64, a as u64, b as u64);
         assert!(map_aliases(&[
@@ -2310,13 +2342,19 @@ mod tests {
             scatter_batched([at(0), at(1), at(2)].as_ptr(), 3, pages.as_ptr()),
             1
         );
-        assert_eq!(view(b), Some(3));
+        // A view per address: remapping one later never takes its
+        // neighbours away for a moment.
+        assert_eq!(
+            (view(b), view(b + PAGE), view(b + 2 * PAGE)),
+            (Some(1), Some(1), Some(1))
+        );
         let unknown = [pages[0], 0x10, pages[2]];
         assert_eq!(
             scatter_batched([at(3), at(1), at(0)].as_ptr(), 3, unknown.as_ptr()),
             0
         );
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(view(b + 2 * PAGE), Some(1), "the neighbour's view was not cut");
         {
             let physical = physical();
             let first = physical.pages.get(&pages[0]).map(|s| s.key(0));
