@@ -2516,8 +2516,29 @@ impl HostHeap {
                 due.push((index as u32, handle));
             }
         }
+        self.leave_none(&mut due, page, from);
         self.mirror_due(&due);
         (looked, due.len() as u64)
+    }
+
+    /// With [`sync_leave_none`]: drops from `due` the slots whose record (in
+    /// `page`, read at `from`) holds no view while the slot shows none, which
+    /// [`HostHeap::mirror`] would find and leave as they are.
+    fn leave_none(&self, due: &mut Vec<(u32, u64)>, page: &[u8], from: usize) {
+        if !sync_leave_none() || due.is_empty() {
+            return;
+        }
+        let before = due.len();
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        due.retain(|&(index, handle)| {
+            let tag = page
+                .get(handle as usize - from..)
+                .and_then(|b| b.get(..4))
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            !shows_nothing(tag, made.get(index as usize).copied())
+        });
+        drop(made);
+        crate::framelog::add(crate::framelog::T::HeapSyncNoneLeft, (before - due.len()) as u64);
     }
 
     /// The first half of [`HostHeap::mirror_copied_page`]: the records it
@@ -2577,6 +2598,8 @@ impl HostHeap {
             *last = print;
             due.push((index, handle));
         }
+        drop(copied);
+        self.leave_none(&mut due, page, from);
         (looked, due)
     }
 
@@ -3761,6 +3784,26 @@ fn constant_view_size(size: u32) -> u32 {
     size.min(MAX_CBV).next_multiple_of(256)
 }
 
+/// Whether the pass over records the title copied into its heaps
+/// (`super::sync_heaps`) leaves alone a changed record that holds no view in
+/// a slot that shows none (`VICTORY_SYNC_LEAVE_NONE=1`; off by default: each
+/// goes to [`HostHeap::mirror`], which takes the slots' lock to find there is
+/// nothing to do). After cgbj 44629de, which counted 32,000 of 41,000 mirrored
+/// records a frame of this kind on water. With several threads
+/// (`VICTORY_SYNC_THREADS`) they are sorted out beside the calling thread. The
+/// frame log's heap pass counts those left ("none left").
+pub(crate) fn sync_leave_none() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_LEAVE_NONE").is_some_and(|v| v == "1"))
+}
+
+/// For [`sync_leave_none`]: whether a record with first word `tag`, in a slot
+/// made from record key `made` (0: none; `None`: past the slots), leaves the
+/// slot as it is. Only a slot that shows nothing and a record with no view.
+fn shows_nothing(tag: u32, made: Option<u64>) -> bool {
+    tag != VIEW_TAG && made == Some(0)
+}
+
 /// Whether a dynamic slot that shows a constant buffer in a list's scratch
 /// chunk holds that chunk too (`VICTORY_SLOT_HOLDS=1`; off by default: only
 /// the list holds it, until it is reset).
@@ -4332,6 +4375,15 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_empty_records_in_empty_slots_are_left() {
+        use super::{VIEW_TAG, shows_nothing};
+        assert!(shows_nothing(0, Some(0)), "no view, slot shows none");
+        assert!(!shows_nothing(0, Some(7)), "no view, slot made: it is unmade");
+        assert!(!shows_nothing(VIEW_TAG, Some(0)), "a view: made");
+        assert!(!shows_nothing(0, None), "past the slots: left to mirror");
+    }
+
     use super::*;
 
     #[test]
