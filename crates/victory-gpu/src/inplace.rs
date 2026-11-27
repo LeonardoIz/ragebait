@@ -273,11 +273,11 @@ struct Views {
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -286,18 +286,18 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    {
-        let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+    views().sections.insert(section, (bytes, committed));
+}
+
+/// Release our copy-back view before Windows can reuse the section handle.
+pub fn title_memory_section_closed(section: usize) {
+    if views().sections.remove(&section).is_none() {
+        return;
     }
-    // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
-    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
-    if gone.is_some() {
-        tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(view)) = own.as_mut().and_then(|views| views.remove(&section)) {
+        // SAFETY: write_own uses this mapping only while it holds OWN.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.base as *mut c_void }) };
     }
 }
 
@@ -506,7 +506,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let &(section_bytes, _) = v.sections.get(&section)?;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -1148,10 +1148,14 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    let mut groups = BTreeMap::new();
+    for &section in v.sections.values() {
+        *groups.entry(section).or_insert(0usize) += 1;
+    }
+    for ((bytes, committed), count) in groups {
         lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
+            "census, {count} sections of {} KiB each, {}",
+            bytes >> 10,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
     }

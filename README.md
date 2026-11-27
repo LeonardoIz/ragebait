@@ -86,6 +86,7 @@ prebuild after a driver or translator change.
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
 | `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
+| `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
 | `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |
