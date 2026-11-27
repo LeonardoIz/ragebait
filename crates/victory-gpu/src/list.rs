@@ -268,6 +268,27 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Under `VICTORY_RAM_TRIM_MB` pressure ([`crate::host::ram_pressure`]):
+/// idle host lists past a warm floor of 16 are let go.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    const KEEP: usize = 16;
+    if !crate::host::ram_pressure() {
+        return;
+    }
+    let excess: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= KEEP {
+            return;
+        }
+        let excess = idle.0.split_off(KEEP);
+        idle.1 = idle.1.saturating_sub(excess.iter().map(|Idle(_, b)| *b).sum());
+        excess
+    };
+    // Dropped outside the lock.
+    drop(excess);
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and

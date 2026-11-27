@@ -193,8 +193,9 @@ fn sweep() {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
+    let interval = if ram_pressure() { 500 } else { 1000 };
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -205,6 +206,25 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::let_go_idle();
+}
+
+/// `VICTORY_RAM_TRIM_MB=<MiB>` (off): while the host's available physical
+/// RAM is below it, the sweep runs every 500 ms and empties the pools kept
+/// for reuse (CPU snapshot buffers, spare texture staging buffers, idle host
+/// lists past 16), for PCs short of memory (after victory-fork PR #1240).
+/// Costs remaking what the pools would have handed out.
+fn ram_trim_bytes() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_RAM_TRIM_MB").ok();
+        mb.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb > 0).map(|mb| mb << 20)
+    })
+}
+
+/// Whether available physical RAM is below `VICTORY_RAM_TRIM_MB` now.
+pub(crate) fn ram_pressure() -> bool {
+    ram_trim_bytes().is_some_and(|limit| available_physical_ram().is_some_and(|avail| avail < limit))
 }
 
 /// Drops `object` once every submission running now has finished: at once

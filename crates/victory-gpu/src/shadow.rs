@@ -2901,6 +2901,10 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    if crate::host::ram_pressure() {
+        let drained = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(drained);
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.

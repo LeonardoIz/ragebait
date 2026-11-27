@@ -553,6 +553,14 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    if crate::host::ram_pressure() {
+        let drained = {
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            spare.1 = 0;
+            std::mem::take(&mut spare.0)
+        };
+        drop(drained);
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
