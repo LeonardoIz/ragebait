@@ -2475,8 +2475,8 @@ struct Deferred {
     /// Textures read back (texture to buffer copies), done once the list
     /// has run: the host buffer the list copies the texels into, the title
     /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// pitch, and the mapping it was recorded against.
+    backs: Vec<(ID3D12Resource, usize, [usize; 3], crate::texback::RowTicket)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -4377,8 +4377,18 @@ fn read_backs(list: &HostList) {
     if backs.is_empty() {
         return;
     }
-    let _mapping = crate::inplace::pin_remap_views();
-    for (buffer, at, [row, rows, pitch]) in backs {
+    // No remapping while the rows land, and none since each was recorded:
+    // the title may have unmapped the destination, or shown other pages there.
+    let _mapping = crate::watch::title_memory_reading();
+    for (buffer, at, [row, rows, pitch], ticket) in backs {
+        if !ticket.valid() {
+            static STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let skipped = STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if skipped.is_power_of_two() {
+                tracing::info!(skipped, "skipping row read-backs whose title memory was remapped");
+            }
+            continue;
+        }
         let len = rows.saturating_sub(1) * pitch + row;
         if crate::inplace::with_remap_views((0, 0), (*at, len), || ()).is_none() {
             continue;
@@ -7616,7 +7626,8 @@ impl HostList {
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+        let ticket = crate::texback::RowTicket::new(dst as usize, rows.saturating_sub(1) * pitch + row);
+        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], ticket));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

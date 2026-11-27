@@ -111,6 +111,21 @@ pub(crate) fn remapped(at: usize, len: usize) {
     invalidate(|ticket| at < ticket.end && ticket.at < end);
 }
 
+/// The mapping of title memory a row read-back lands in
+/// ([`crate::host::HostList::defer_read_back`]), taken when it is recorded.
+pub(crate) struct RowTicket(Arc<Ticket>);
+
+impl RowTicket {
+    pub(crate) fn new(at: usize, len: usize) -> Self { Self(track(0, at, at.saturating_add(len))) }
+
+    /// Under [`crate::watch::title_memory_reading`]: whether nothing
+    /// remapped the range since it was recorded.
+    pub(crate) fn valid(&self) -> bool {
+        let _tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.valid.load(Ordering::Acquire)
+    }
+}
+
 pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
@@ -376,6 +391,17 @@ mod tests {
         let ticket = track(95, 0x7_0000, 0x8_0000);
         crate::title_memory_remapped(0x7_8000, 0x1000);
         assert!(!ticket.valid.load(Ordering::Acquire));
+    }
+
+    /// A row read-back's ticket ends with a remapping of any of its bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_remapping_notice_invalidates_row_read_backs() {
+        let ticket = RowTicket::new(0x9_0000, 0x1000);
+        let beside = RowTicket::new(0x9_2000, 0x1000);
+        crate::title_memory_remapped(0x9_0fff, 1);
+        assert!(!ticket.valid());
+        assert!(beside.valid());
     }
 
     /// A reset of one page of a view that stays mapped (`victory-hle`
