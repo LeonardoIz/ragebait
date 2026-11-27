@@ -3856,7 +3856,10 @@ impl<'a> Lower<'a> {
         // shortcut: another half may still have active lanes; upgrade when both can exchange.
         let local_any = self.local
             && self.local_any
-            && std::env::var_os("VICTORY_SCC_LOCAL_ANY").is_some_and(|v| v == "1");
+            && {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| std::env::var_os("VICTORY_SCC_LOCAL_ANY").is_some_and(|v| v == "1"))
+            };
         if !self.console_lanes || self.local && !local_any || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
         }

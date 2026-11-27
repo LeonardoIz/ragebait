@@ -2534,7 +2534,8 @@ impl HostHeap {
             let tag = page
                 .get(handle as usize - from..)
                 .and_then(|b| b.get(..4))
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                // An unreadable record counts as a view: kept, the safe side.
+                .map_or(super::VIEW_TAG, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             !shows_nothing(tag, made.get(index as usize).copied())
         });
         drop(made);

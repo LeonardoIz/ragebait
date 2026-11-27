@@ -87,6 +87,11 @@ prebuild after a driver or translator change.
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
 | `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
+| `VICTORY_MAP_RUNS=1` | Off | Map runs of adjacent physical pages with one view |
+| `VICTORY_REMAP_BATCH=1` | Off | Batch a remap call's unmaps and maps under one lock. A view never spans two title mappings |
+| `VICTORY_CB_IN_PLACE=1` | Off | Point fresh-table constant buffer views at the card copy of the title's buffer instead of copying to scratch |
+| `VICTORY_SLOT_HOLDS=1` | Off | A dynamic slot showing a scratch constant buffer holds that scratch chunk |
+| `VICTORY_SYNC_LEAVE_NONE=1` | Off | The heap pass skips changed records with no view in slots that show none |
 | `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
