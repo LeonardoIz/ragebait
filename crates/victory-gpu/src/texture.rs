@@ -1462,8 +1462,11 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::inplace::with_remap_views((p, 1), (0, 0), || {
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) }
+        })
+        .unwrap_or(0);
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
@@ -1519,8 +1522,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::inplace::with_remap_views((p, 1), (0, 0), || {
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) }
+        })
+        .unwrap_or(0);
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {
             break;

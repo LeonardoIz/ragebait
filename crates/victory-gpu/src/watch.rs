@@ -1209,8 +1209,13 @@ fn protect_alias(g: &mut Guards, block: usize) {
         return;
     }
     let mut old = 0;
-    // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    let at = block * BLOCK;
+    let guarded = crate::inplace::with_remap_views((at, BLOCK), (0, 0), || {
+        // SAFETY: title view memory; only its protection changes.
+        unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) != 0 }
+    })
+    .unwrap_or(false);
+    if guarded {
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -1223,15 +1228,12 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
+        let (at, len) = (from * BLOCK, (to - from) * BLOCK);
+        crate::inplace::with_remap_views((at, len), (0, 0), || {
+            // SAFETY: title view memory; only its protection changes.
+            unsafe { VirtualProtect(at as *const _, len, PAGE_READONLY, &mut old) != 0 }
+        })
+        .unwrap_or(false)
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1544,6 +1546,14 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    title_memory_changing(at, len, || ((), true));
+}
+
+/// Replace a view and reset its guard record with no guard writer between
+/// those steps. The mapper holds the remapping lock and does no callbacks
+/// into the GPU from inside `change`. Its boolean says whether the guard
+/// state became invalid. A failed unmap can leave the old guard live.
+pub fn title_memory_changing<T>(at: usize, len: usize, change: impl FnOnce() -> (T, bool)) -> T {
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
@@ -1556,6 +1566,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
+    let (result, changed) = change();
+    if changed {
+        forget_mapping(&mut g, at, len);
+    }
+    result
+}
+
+fn forget_mapping(g: &mut Guards, at: usize, len: usize) {
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -1621,7 +1639,10 @@ fn install() {
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
+        // The lazy handler may have already passed a write fault on the
+        // old read-only view. Recheck the current view while the guard
+        // lock excludes a replacement.
+        if crate::inplace::retry_remap_write(at, || writable(at)) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH

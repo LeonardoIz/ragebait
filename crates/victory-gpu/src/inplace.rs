@@ -283,6 +283,43 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type Range = (usize, usize);
+type ViewAccess = fn(Range, Range, bool, &mut dyn FnMut());
+static VIEW_ACCESS: std::sync::OnceLock<ViewAccess> = std::sync::OnceLock::new();
+
+/// Installs the physical mapper's resolver when lazy aliases are enabled.
+/// The resolver keeps both ranges native for the duration of the operation.
+pub fn use_remap_views(access: ViewAccess) {
+    let _ = VIEW_ACCESS.set(access);
+}
+
+/// Pins the mapping through a read/modify/write into title memory.
+pub(crate) fn pin_remap_views() -> Option<crate::watch::Reading> {
+    VIEW_ACCESS.get().map(|_| crate::watch::title_memory_reading())
+}
+
+/// A leaf kernel operation that cannot fault a deferred page into place.
+pub(crate) fn with_remap_views<T>(read: Range, write: Range, run: impl FnOnce() -> T) -> Option<T> {
+    access_remap_views(read, write, false, run)
+}
+
+/// A write fault that remains after checking the GPU's guards.
+pub(crate) fn retry_remap_write(at: usize, writable: impl FnOnce() -> bool) -> bool {
+    access_remap_views((at, 1), (0, 0), true, writable).unwrap_or(false)
+}
+
+fn access_remap_views<T>(read: Range, write: Range, fault: bool, run: impl FnOnce() -> T) -> Option<T> {
+    let Some(access) = VIEW_ACCESS.get() else { return Some(run()) };
+    let mut run = Some(run);
+    let mut result = None;
+    access(read, write, fault, &mut || {
+        if let Some(run) = run.take() {
+            result = Some(run());
+        }
+    });
+    result
+}
+
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {

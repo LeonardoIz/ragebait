@@ -3,6 +3,24 @@ use std::sync::{LazyLock, Mutex, Once};
 
 use crate::framelog::{T, total};
 
+fn lazy_totals() -> [u64; 6] {
+    [
+        T::RemapLazyDeferred,
+        T::RemapLazyDiscarded,
+        T::RemapLazyViews,
+        T::RemapLazyFaults,
+        T::RemapLazyFailures,
+        T::RemapLazyUs,
+    ]
+    .map(total)
+}
+
+fn lazy_counts([deferred, discarded, views, faults, failures, us]: [u64; 6]) -> String {
+    format!(
+        "lazy_deferred={deferred} lazy_discarded={discarded} lazy_materialized={views} lazy_fault_views={faults} lazy_failures={failures} lazy_materialize_us={us}"
+    )
+}
+
 const RECENT_FRAMES: u64 = 8;
 type Backing = usize;
 
@@ -160,6 +178,7 @@ struct Stats {
     total: Counts,
     pages: HashMap<usize, Page>,
     previous_end: Option<usize>,
+    last_lazy: [u64; 6],
 }
 
 impl Stats {
@@ -231,19 +250,23 @@ pub fn record(
 }
 
 pub(crate) fn frame(log: bool) {
-    let (frame, counts) = {
+    let (frame, counts, lazy) = {
         let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let stats = guard.get_or_insert_with(Stats::default);
         stats.frame += 1;
         stats.previous_end = None;
-        (stats.frame, std::mem::take(&mut stats.current))
+        let totals = lazy_totals();
+        let lazy = std::array::from_fn(|i| totals[i].wrapping_sub(stats.last_lazy[i]));
+        stats.last_lazy = totals;
+        (stats.frame, std::mem::take(&mut stats.current), lazy)
     };
     if log {
         tracing::info!(
-            "frame {frame} remap stats | {} | {} | {}",
+            "frame {frame} remap stats | {} | {} | {} | {}",
             counts.activity(),
             counts.histograms(),
-            counts.time()
+            counts.time(),
+            lazy_counts(lazy)
         );
     }
 }
@@ -270,7 +293,7 @@ pub fn log_summary() {
             s.total.activity()
         );
         tracing::info!("remap stats distribution | {}", s.total.histograms());
-        tracing::info!("remap stats time | {}", s.total.time());
+        tracing::info!("remap stats time | {} | {}", s.total.time(), lazy_counts(lazy_totals()));
     }
 }
 
