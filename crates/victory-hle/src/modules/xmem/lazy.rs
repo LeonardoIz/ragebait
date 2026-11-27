@@ -328,15 +328,21 @@ pub(super) fn alias(p: &mut Physical, to: usize, from: usize, len: usize) -> boo
     if from == 0 {
         return clear(p, to, len);
     }
-    if to.abs_diff(from) < len && !clear(p, to, len) {
-        return false;
-    }
-    for k in (0..len).step_by(PAGE) {
-        let slice = slice_at(&p.views, from + k);
-        if slice.is_none() || !replace(p, to + k, slice, true) {
-            clear(p, to + k, len - k);
+    // Read every source before anything changes, so a source inside `to`
+    // (A to A, or a partial overlap) is not lost, as in `alias_in_runs`.
+    let wanted: Vec<Slice> = (0..len / PAGE)
+        .map_while(|k| slice_at(&p.views, from + k * PAGE))
+        .collect();
+    for (k, slice) in wanted.iter().enumerate() {
+        if !replace(p, to + k * PAGE, Some(slice.clone()), true) {
+            clear(p, to + k * PAGE, len - k * PAGE);
             return false;
         }
+    }
+    let done = wanted.len() * PAGE;
+    if done < len {
+        clear(p, to + done, len - done);
+        return false;
     }
     true
 }

@@ -212,3 +212,22 @@ fn racing_reads_resolve_either_live_backing() {
         }
     });
 }
+
+#[test]
+fn overlapping_aliases_read_sources_before_changing_targets() {
+    let mut memory = Memory::new();
+    let base = memory.base;
+    // A to A: the only view of page 0 is its own source.
+    memory.alias(0, 0);
+    // SAFETY: page 0 stays logically mapped.
+    assert_eq!(unsafe { (base as *const u8).read_volatile() }, 1);
+
+    // Partial overlap: pages 1..3 take what pages 0..2 showed.
+    assert!(alias(&mut memory.physical, base + PAGE, base, 2 * PAGE));
+    // SAFETY: pages 0..3 are logically mapped.
+    unsafe {
+        assert_eq!((base as *const u8).read_volatile(), 1);
+        assert_eq!(((base + PAGE) as *const u8).read_volatile(), 1);
+        assert_eq!(((base + 2 * PAGE) as *const u8).read_volatile(), 2);
+    }
+}
