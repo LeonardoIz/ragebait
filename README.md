@@ -102,6 +102,8 @@ The first start warms every shader and can take many minutes;
 | `VICTORY_CB_IN_PLACE=1` | Off | Point fresh-table constant buffer views at the card copy of the title's buffer instead of copying to scratch |
 | `VICTORY_SLOT_HOLDS=1` | Off | A dynamic slot showing a scratch constant buffer holds that scratch chunk |
 | `VICTORY_SYNC_LEAVE_NONE=1` | Off | The heap pass skips changed records with no view in slots that show none |
+| `VICTORY_SCRATCH_ANY_SIZE=1` | Off | A list's small first scratch chunk may reuse a kept 4 MiB chunk when no small one is kept |
+| `VICTORY_SCRATCH_SPARE_MB` | 128 | Set the most MiB of scratch chunks kept while no list holds them |
 | `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |

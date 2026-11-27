@@ -1810,7 +1810,8 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
+/// The most bytes of chunks kept while no list holds them, unless
+/// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
 const SPARE_MOST: u64 = 128 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
@@ -1857,18 +1858,33 @@ impl<T> Spare<T> {
     }
 }
 
+impl<T> Spare<T> {
+    /// A kept chunk of `size` bytes; with `any`, a small first chunk
+    /// ([`SCRATCH_FIRST`]) none of which is kept may be a 4 MiB one. And the
+    /// size of the chunk handed out.
+    fn take_chunk(&mut self, size: u64, any: bool) -> Option<(T, u64)> {
+        self.take(size).map(|c| (c, size)).or_else(|| {
+            (any && size == SCRATCH_FIRST).then(|| self.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK)))?
+        })
+    }
+}
+
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size. With [`scratch_any_size`], a small first chunk
+/// ([`SCRATCH_FIRST`]) asked for while none of them is kept is a kept 4 MiB
+/// one (after victory-fork PR #1367).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let kept = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take_chunk(size, scratch_any_size());
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
@@ -1876,15 +1892,39 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
+    let chunk = Chunk {
         buffer,
         data: data as usize,
         gpu,
+    };
+    Some((chunk, size))
+}
+
+/// Whether a list's small first chunk may be a kept 4 MiB one when no small
+/// one is kept (`VICTORY_SCRATCH_ANY_SIZE=1`, off: only one of its own size
+/// is reused). Upstream saw every spare a 4 MiB one while small first chunks
+/// were made new and freed each frame (about 1 ms each); costs up to 4 MiB
+/// less room per list for the cheap small-first-chunk path.
+fn scratch_any_size() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ANY_SIZE").is_some_and(|v| v == "1"))
+}
+
+/// The most bytes of scratch chunks kept while no list holds them:
+/// `VICTORY_SCRATCH_SPARE_MB` (upstream raised it to 512 when the lists held
+/// some 140 MB of chunks at once and chunks past the bound were freed and
+/// made anew every frame), else [`SPARE_MOST`]. More keeps more of the PC's
+/// memory.
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok();
+        mb.and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST, |mb| mb << 20)
     })
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -1895,7 +1935,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
@@ -7614,7 +7654,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -10421,6 +10461,22 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A small first chunk takes a kept 4 MiB one only when allowed and no
+    /// small one is kept; other sizes never take another size.
+    #[test]
+    fn a_small_first_chunk_may_be_a_kept_big_one() {
+        use super::{SCRATCH_CHUNK, SCRATCH_FIRST};
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(spare.take_chunk(SCRATCH_FIRST, false), None, "off: exact size only");
+        assert_eq!(spare.give(2, SCRATCH_FIRST, u64::MAX), None);
+        assert_eq!(spare.take_chunk(SCRATCH_FIRST, true), Some((2, SCRATCH_FIRST)), "a small one first");
+        assert_eq!(spare.take_chunk(SCRATCH_FIRST, true), Some((1, SCRATCH_CHUNK)));
+        assert_eq!(spare.bytes, 0);
+        assert_eq!(spare.give(3, SCRATCH_FIRST, u64::MAX), None);
+        assert_eq!(spare.take_chunk(SCRATCH_CHUNK, true), None, "a big one never takes a small one");
     }
 }
 
