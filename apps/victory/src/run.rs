@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(windows)]
+fn precompile_dir(exe: &Path) -> &Path {
+    exe.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
 /// Runs `victory precompile <title_dir>` and waits; a failure is said, never fatal.
 #[cfg(windows)]
 fn precompile(title_dir: &Path) {
@@ -36,7 +41,7 @@ pub fn run(
     // were made for changed, in a process of its own (its memory is gone before
     // the title's), and the run records new pipelines for the next one.
     if execute && std::env::var_os("VICTORY_AUTO_PRECOMPILE").is_some_and(|v| v == "1") {
-        precompile(exe.parent().unwrap_or(Path::new(".")));
+        precompile(precompile_dir(exe));
     }
     let prepared = victory_loader::prepare(
         &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
@@ -335,7 +340,14 @@ impl LoaderLock {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn precompile_uses_the_current_directory_for_a_bare_executable() {
+        assert_eq!(super::precompile_dir(Path::new("game.exe")), Path::new("."));
+        assert_eq!(super::precompile_dir(Path::new("titles/game.exe")), Path::new("titles"));
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
