@@ -751,6 +751,12 @@ impl Waiting {
     }
 }
 
+/// `VICTORY_FAIR_DUE=1` alternates due texture retries and fresh slots.
+pub(crate) fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_some_and(|v| v == "1"))
+}
+
 thread_local! {
     /// This thread is inside [`HostHeap::publish`].
     static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -792,15 +798,10 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+    /// Retries go newest first. Fresh slots alternate newest and oldest.
+    /// Fair mode alternates the two classes, starting with a retry, so a
+    /// time-limited pass can reach fresh slots even during a retry backlog.
+    fn due(&self, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -811,17 +812,23 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
-            }
+        let mut order = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let mut again = again.into_iter().map(|(_, index, write)| (index, write));
+        if !fair {
+            order.extend(again.by_ref().take(max));
         }
-        order.truncate(max);
+        let mut fresh = fresh.into_iter();
+        let mut newest = true;
+        while order.len() < max && !fresh.as_slice().is_empty() {
+            order.extend(again.next());
+            if order.len() == max {
+                break;
+            }
+            let next = if newest { fresh.next() } else { fresh.next_back() };
+            order.extend(next.map(|(_, index, write)| (index, write)));
+            newest = !newest;
+        }
+        order.extend(again.take(max - order.len()));
         order
     }
 
@@ -1479,7 +1486,7 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        (if max == 0 { Vec::new() } else { textures.due(frame, max, fair_due()) }, textures.census(frame))
     }
 
     /// See [`TextureQueue::requeue`].
@@ -4482,37 +4489,37 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100, false).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
+        assert_eq!(q.due(9, 2, false).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100, false).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100, false).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100, false)[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100, false).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100, false)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100, false)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -4520,11 +4527,11 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100, false).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100, false).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100, false).iter().any(|d| d.0 == 98));
     }
 
     #[test]
@@ -4543,10 +4550,10 @@ mod tests {
         assert_eq!(q.early(11, 2), [(1, 1), (2, 2)]);
         assert_eq!(q.claim_early(1, 1, 11), Some((memory.0, memory.1, 11, 0, 10)));
         assert!(q.claim_early(1, 1, 11).is_none());
-        assert!(q.due(11, 4).is_empty());
+        assert!(q.due(11, 4, false).is_empty());
         assert_eq!(q.early(12, 2), [(2, 2), (3, 3)]);
         assert!(q.early(14, 4).is_empty());
-        assert_eq!(q.due(14, 4).len(), 4);
+        assert_eq!(q.due(14, 4, false).len(), 4);
 
         // An ordinary look that found the same bytes preserves the early window.
         q.recheck(1, 1, 26, memory, 11, 1, 10, None);
@@ -4568,7 +4575,7 @@ mod tests {
         q.hold(1, 1, 30);
         assert!(q.early(13, 1).is_empty());
         assert_eq!(q.room(13), 1);
-        assert_eq!(q.due(13, 1), [(1, 1)]);
+        assert_eq!(q.due(13, 1, false), [(1, 1)]);
 
         q.recheck(1, 1, 18, memory, 13, 0, 14, Some(15));
         assert_eq!(q.early(15, 1), [(1, 1)]);
@@ -4576,7 +4583,24 @@ mod tests {
         assert!(q.claim_early(1, 1, 15).is_none());
         q.recheck(1, 1, 19, memory, 14, 0, 15, Some(16));
         assert!(q.early(16, 1).is_empty());
-        assert_eq!(q.due(15, 1), [(1, 2)]);
+        assert_eq!(q.due(15, 1, false), [(1, 2)]);
+    }
+
+    #[test]
+    fn fair_due_reaches_fresh_slots_in_a_bounded_pass() {
+        let mut q = TextureQueue::default();
+        for index in 0..10 {
+            q.written(index, 1, 1, false);
+            q.later(index, u64::from(index) + 1, 1, 1);
+        }
+        for index in 10..13 {
+            q.written(index, 2, 2, false);
+        }
+        let indices = |max, fair| q.due(2, max, fair).into_iter().map(|(index, _)| index).collect::<Vec<_>>();
+        assert_eq!(indices(6, false), [9, 8, 7, 6, 5, 4]);
+        assert_eq!(indices(6, true), [9, 12, 8, 10, 7, 11]);
+        assert_eq!(indices(7, true), [9, 12, 8, 10, 7, 11, 6]);
+        assert!(indices(0, true).is_empty());
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -4589,25 +4613,25 @@ mod tests {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let due = q.due(1, 100, false);
         assert_eq!(due.len(), 4);
         // The card is full: slots 20 and 21 are held back until frame 101.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
             q.hold(index, write, 101);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 100, false).into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
         assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
         // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.due(101, 100, false), due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 100, false).iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 100, false).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
     }
 
@@ -4622,7 +4646,7 @@ mod tests {
         q.written(5, 1, 0, false);
         q.written(6, 1, 50, false);
         q.written(7, 1, 0, false);
-        let due = q.due(1, 100);
+        let due = q.due(1, 100, false);
         let write = |index: u32| due.iter().find(|d| d.0 == index).map(|d| d.1).unwrap();
         assert!(!due.iter().any(|d| d.0 == 6), "slot 6 is not due before frame 50");
         q.hold(7, write(7), 101);
@@ -4636,7 +4660,7 @@ mod tests {
         assert_eq!(named(&q), [5, 6, 7, 8]);
         assert_eq!(q.checked(5), None);
         assert_eq!(q.queued(&[6]), six, "slot 6 waited already: as it was");
-        let now: Vec<u32> = q.due(3, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(3, 100, false).into_iter().map(|d| d.0).collect();
         assert!(now.contains(&5) && now.contains(&8) && !now.contains(&6) && !now.contains(&7));
     }
 

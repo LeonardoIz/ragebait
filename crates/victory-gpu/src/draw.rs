@@ -2787,12 +2787,8 @@ impl State {
         // What a run for a bake draw's own may upload.
         let sourced_at_most = bake_sources_mode().1;
         let mut sourced_bytes = 0u64;
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // Mapping notifications already make waiting slots due. This
+        // periodic check covers changes those notifications miss.
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         // (A run for a bake draw's own leaves the time between passes as
@@ -2800,7 +2796,20 @@ impl State {
         let took = if only { 100 } else { now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1) };
         // The worker may run two passes in a frame: no shorter than that.
         let took = if matches!(into, Into::Ahead(_)) { took.max(100) } else { took };
-        let most = (4000 / took).clamp(16, 256);
+        // `VICTORY_RELOOK_MS` overrides the retry window in milliseconds.
+        // Fair mode uses a longer window to reduce repeated work on unmapped slots.
+        static RELOOK: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (relook_ms, max_frames) = *RELOOK.get_or_init(|| {
+            let override_ms = std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok());
+            if let Some(ms) = override_ms {
+                (ms, 1024)
+            } else if crate::descriptor::host::fair_due() {
+                (20_000, 1024)
+            } else {
+                (4000, 256)
+            }
+        });
+        let most = (relook_ms / took).clamp(16, max_frames);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3066,7 +3075,7 @@ impl State {
             let title_fills = crate::resource::host_resource(resource).is_some_and(|texture| crate::texture::title_written(&texture));
             if !title_fills {
                 if crate::resource::eviction_enabled() && crate::resource::host_waits(resource) {
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, frame, (4000 / took).clamp(16, 256));
                     continue;
                 }
                 // a render target, a depth or unordered access texture: the host's own
