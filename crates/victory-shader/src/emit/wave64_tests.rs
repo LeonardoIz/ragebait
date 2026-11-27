@@ -146,6 +146,36 @@ fn lowered_with_entry(
 }
 
 #[test]
+fn loose_lds_splits_a_wave_with_reads_and_writes_in_a_lane_branch() {
+    let mut native = native(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0007, // s_cbranch_execz past the LDS work and store
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xD8D8_0000,
+        0x0600_0001, // ds_read_b32 v6, v1
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let container = crate::dxbc::Container { digest: [0; 16], version: (1, 0), parts: vec![] };
+    let translate = || super::emit_program(&container, &native, &p, &st, &io, &res).unwrap().1;
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let strict = translate();
+    let loose = lower::with_loose_lds(translate);
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!((strict, loose), (Some(64), Some(32)));
+}
+
+#[test]
 fn a_swap_with_a_uniform_register_keeps_the_lane_value_lane_dependent() {
     // v0 (the thread id) is a per-lane LDS address; after the swap v5 holds it. The swap's
     // source v5 was uniform, but its destination v0 was not: the read from v5 must not be

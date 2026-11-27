@@ -25,32 +25,34 @@ mod tests {
     #[test]
     fn scoped_lowering_modes_restore_after_a_panic() {
         use super::super::{
-            FIRST_HALF_PAIRS, LOCAL_ANY, LOCAL_WAVES, with_first_half_pairs, with_local_waves,
-            with_local_waves_any,
+            FIRST_HALF_PAIRS, LOCAL_ANY, LOCAL_WAVES, LOOSE_LDS, with_first_half_pairs,
+            with_local_waves, with_local_waves_any, with_loose_lds,
         };
 
-        let modes = || (LOCAL_WAVES.get(), LOCAL_ANY.get(), FIRST_HALF_PAIRS.get());
-        assert_eq!(modes(), (false, false, false));
+        let modes = || (LOCAL_WAVES.get(), LOCAL_ANY.get(), FIRST_HALF_PAIRS.get(), LOOSE_LDS.get());
+        assert_eq!(modes(), (false, false, false, false));
 
         with_local_waves(|| {
             with_local_waves_any(|| {
-                with_first_half_pairs(|| assert_eq!(modes(), (true, true, true)));
-                assert_eq!(modes(), (true, true, false));
+                with_first_half_pairs(|| assert_eq!(modes(), (true, true, true, false)));
+                assert_eq!(modes(), (true, true, false, false));
             });
-            assert_eq!(modes(), (true, false, false));
+            assert_eq!(modes(), (true, false, false, false));
         });
-        assert_eq!(modes(), (false, false, false));
+        assert_eq!(modes(), (false, false, false, false));
 
         let failure = std::panic::catch_unwind(|| {
             with_local_waves_any(|| {
                 with_first_half_pairs(|| {
-                    assert_eq!(modes(), (true, true, true));
-                    panic!("synthetic lowering panic");
+                    with_loose_lds(|| {
+                        assert_eq!(modes(), (true, true, true, true));
+                        panic!("synthetic lowering panic");
+                    });
                 });
             });
         })
         .expect_err("the lowering panic should be caught");
         assert_eq!(failure.downcast_ref::<&str>(), Some(&"synthetic lowering panic"));
-        assert_eq!(modes(), (false, false, false));
+        assert_eq!(modes(), (false, false, false, false));
     }
 }

@@ -572,6 +572,33 @@ fn emit_with_wave_wide(
                 }
             }
         }
+        // `VICTORY_WAVE_LDS_LOOSE=1` enables the final wave64 retry. In a
+        // divergent region, the two host waves only synchronize LDS at its boundaries.
+        if !strict && std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_some_and(|v| v == "1") {
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| {
+                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
+                });
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

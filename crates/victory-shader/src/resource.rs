@@ -2339,8 +2339,20 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let width = constant(src.first()?)? & 31;
+        let offset = constant(src.get(1)?)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << offset));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
+        // The literal of a 64-bit integer move is zero-extended.
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -2389,6 +2401,22 @@ pub(crate) mod tests {
     use crate::native::RootType::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn descriptor_tracing_folds_bit_masks_and_wide_literals() {
+        let words = [
+            0x8000_0000u32 | 0x24 << 23 | 0x8583, // s_bfm_b32 s0, 3, 5
+            0xBE82_04FF, // s_mov_b64 s[2:3], literal
+            0x89ab_cdef,
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let insts = &p.blocks[0].insts;
+        assert!(matches!(copy_source(&insts[0], 0), Some(Moved::Const(0b1110_0000))));
+        assert!(matches!(copy_source(&insts[1], 0), Some(Moved::Const(0x89ab_cdef))));
+        assert!(matches!(copy_source(&insts[1], 1), Some(Moved::Const(0))));
+    }
 
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
