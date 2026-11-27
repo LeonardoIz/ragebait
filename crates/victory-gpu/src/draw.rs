@@ -1062,9 +1062,21 @@ fn recheck_soon() -> bool {
 
 /// `VICTORY_TEXTURE_WATCH=1` (off by default) adds bounded fingerprint checks
 /// for bindless textures recently found changed, without arming page guards.
+/// They get the first eighth of a texture pass's remaining time and bytes.
 fn texture_watch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_WATCH").is_some_and(|v| v == "1"))
+}
+
+/// Give early checks a bounded turn before the due queue, whose order also
+/// accounts for `VICTORY_FAIR_DUE`.
+fn texture_pass_slots(
+    due: Vec<(u32, u64)>,
+    early: Vec<(u32, u64)>,
+    mut watch_has_budget: impl FnMut() -> bool,
+) -> impl Iterator<Item = ((u32, u64), bool)> {
+    early.into_iter().take_while(move |_| watch_has_budget()).map(|slot| (slot, true))
+        .chain(due.into_iter().map(|slot| (slot, false)))
 }
 
 /// Uploads of textures picked by index looked at again in the next frame
@@ -2852,25 +2864,37 @@ impl State {
         const WATCH_BYTES: u64 = 128 << 10;
         static WATCH_FRAME: AtomicU64 = AtomicU64::new(0);
         let watch = texture_watch() && heap_recheck();
+        let spent = SPENT.load(Ordering::Relaxed);
+        let ahead = matches!(into, Into::Ahead(_));
         let early = if watch
             && !only
-            && SPENT.load(Ordering::Relaxed) < bytes_at_most
+            && !span.is_zero()
+            && spent < bytes_at_most
+            && !(ahead && crate::heap_worker::make_way())
             && WATCH_FRAME.load(Ordering::Relaxed) <= frame
         {
             let started = std::time::Instant::now();
             let slots = host.texture_slots_early(frame, WATCH_SLOTS);
             crate::framelog::add(crate::framelog::T::TextureWatchUs, started.elapsed().as_micros() as u64);
-            if !slots.is_empty() {
-                WATCH_FRAME.fetch_max(frame + 1, Ordering::Relaxed);
-            }
             slots
         } else {
             Vec::new()
         };
         let began = std::time::Instant::now();
-        // Ordinary due slots first: the extra looks get what of the budget they leave
-        // (one not reached stays early-due for a later frame).
-        let slots = due.into_iter().map(|slot| (slot, false)).chain(early.into_iter().map(|slot| (slot, true)));
+        // Check between slots, as for the pass-wide limits. An upload in
+        // progress may finish past the share. Unreached checks stay early-due.
+        let watch_until = spent.saturating_add((bytes_at_most.saturating_sub(spent) / 8).max(1));
+        let mut watch_started = false;
+        let slots = texture_pass_slots(due, early, || {
+            if began.elapsed() > span / 8
+                || SPENT.load(Ordering::Relaxed) >= watch_until
+                || (ahead && crate::heap_worker::make_way())
+            {
+                return false;
+            }
+            watch_started = watch_started || WATCH_FRAME.fetch_max(frame + 1, Ordering::Relaxed) <= frame;
+            watch_started
+        });
         for ((index, write), early) in slots {
             // A run for a bake draw's own ends at its own bytes, not at the
             // frame's budget or time.
@@ -2882,7 +2906,6 @@ impl State {
             } else if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
-            let ahead = matches!(into, Into::Ahead(_));
             if ahead && crate::heap_worker::make_way() {
                 break;
             }
@@ -5175,6 +5198,21 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_watch_gets_a_bounded_turn_under_due_load() {
+        let due = vec![(12, 12), (16, 16), (11, 11), (1, 1)];
+        let early = vec![(2, 2), (3, 3), (4, 4)];
+        let served = std::cell::Cell::new(0);
+        let mut slots = texture_pass_slots(due.clone(), early, || served.get() < 2);
+        assert_eq!(slots.next(), Some(((2, 2), true)));
+        served.set(1);
+        assert_eq!(slots.next(), Some(((3, 3), true)));
+        served.set(2);
+        assert!(slots.eq(due.iter().copied().map(|slot| (slot, false))));
+        assert!(texture_pass_slots(due.clone(), Vec::new(), || panic!("watch off"))
+            .eq(due.into_iter().map(|slot| (slot, false))));
+    }
 
     #[test]
     fn a_stage_reusing_a_table_mirrors_the_texture_selected_by_a_root_constant() {

@@ -82,10 +82,12 @@ prebuild after a driver or translator change.
 | `VICTORY_WAVE_LDS_LOOSE=1` | Off | Retry wave64 compute shaders on 32-lane hosts with LDS barriers at divergent region boundaries. A read may miss the other host wave's write within a region |
 | `VICTORY_SCC_LOCAL_ANY=1` | Off | Allow the local-wave retry to use each host wave's own result for scalar tests of whether a lane mask is nonempty |
 | `VICTORY_FAIR_DUE=1` | Off | Alternate due texture retries with fresh slots |
+| `VICTORY_TEXTURE_WATCH=1` | Off | Recheck small textures recently found changed. Up to 32 early checks per frame get the first eighth of the pass's remaining time and staging budget |
 | `VICTORY_RELOOK_MS` | 4,000 ms, or 20,000 ms with fair scheduling | Set the retry window for textures whose memory is missing. The window is clamped to 16–256 frames by default or 16–1,024 with fair scheduling or an explicit override |
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
 | `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
+| `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
 | `VICTORY_PSO_PREBUILD` | Off | Record pipelines for offline prebuild |

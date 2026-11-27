@@ -362,11 +362,34 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 }
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
-// reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
+// reservations, at more than one address if it likes. Allocations use
+// pagefile-backed sections, their pages are 64 KiB slices, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+
+/// `VICTORY_SECTION_MB=2` caps a backing section at 2 MiB, reducing the
+/// number of views sharing a Windows section during remaps. Unset or zero
+/// keeps one section per allocation (victory-fork #1274).
+fn section_pages() -> usize {
+    #[cfg(test)]
+    if let Some(pages) = TEST_SECTION_PAGES.get() {
+        return pages;
+    }
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if mb == 0 { usize::MAX } else { mb.saturating_mul(MIB / PAGE) }
+    });
+    *PAGES
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SECTION_PAGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
 struct Section {
     handle: HANDLE,
@@ -381,6 +404,7 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_closed(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -433,60 +457,73 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    allocate_physical_pages(flags, count, pages, section_pages())
+}
+
+fn allocate_physical_pages(
+    flags: u64,
+    count: *mut usize,
+    pages: *mut usize,
+    per_section: usize,
+) -> BOOL {
     if count.is_null() || pages.is_null() {
         return 0;
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+    }
+    let committed = on_wine();
+    let mut sections = Vec::new();
+    if sections.try_reserve_exact(n.div_ceil(per_section)).is_err() {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
     }
+    for offset in (0..n).step_by(per_section) {
+        let chunk = (n - offset).min(per_section);
+        let size = (chunk * PAGE) as u64;
+        // SAFETY: pagefile-backed section. On Windows the pages are committed
+        // on first use. Wine makes a committed section a sparse file.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if committed { SEC_COMMIT } else { SEC_RESERVE },
+                (size >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null. Earlier sections close on drop.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        sections.push((offset, chunk, Section { handle, first_page: 0 }));
+    }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let mut physical = physical();
     let first = physical.next_page;
-    let section = Arc::new(Section { handle, first_page: first });
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    for (offset, chunk, mut section) in sections {
+        section.first_page = first + offset * FRAMES;
+        victory_gpu::title_memory_section(section.handle as usize, (chunk * PAGE) as u64, committed);
+        let section = Arc::new(section);
+        for index in 0..chunk {
+            let number = section.first_page + index * FRAMES;
+            physical.pages.insert(number, Slice { section: section.clone(), index });
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(offset + index).write(number) };
+        }
     }
     1
 }
@@ -623,8 +660,8 @@ impl PageWindow {
 }
 
 /// A window on bytes `[offset, offset + len)` of `pages` when they are
-/// consecutive pages of one allocation (how titles usually hand them out);
-/// `None` otherwise (pages of several allocations, out of order, or
+/// consecutive pages of one section (an allocation may have several);
+/// `None` otherwise (pages of several sections, out of order, or
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
@@ -891,7 +928,9 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: *const usize
                 })
             })
             .count();
-        let mapped = if map_runs() {
+        // With section caps, a new run can cross a placeholder boundary
+        // left by a previous run whose section ended at a different page.
+        let mapped = if map_runs() || section_pages() != usize::MAX {
             map_run(physical, base + i * PAGE, run, &first)
         } else {
             map(physical, base + i * PAGE, run * PAGE, first)
@@ -2384,6 +2423,89 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn section_cap_preserves_page_numbers_and_cross_section_writes() {
+        let boundary = 2 * MIB / PAGE;
+        for per_section in [usize::MAX, boundary] {
+            let mut n = boundary + 1;
+            let mut pages = vec![0; n];
+            assert_eq!(allocate_physical_pages(0, &mut n, pages.as_mut_ptr(), per_section), 1);
+            assert_eq!(n, pages.len());
+            assert!(pages.windows(2).all(|pair| pair[1] == pair[0] + FRAMES));
+            let groups = runs(&pages, 0, n * PAGE).unwrap();
+            let lengths: Vec<_> = groups.iter().map(|(slice, len)| (slice.index, *len)).collect();
+            let expected: &[_] = if per_section == boundary {
+                &[(0, boundary), (0, 1)]
+            } else {
+                &[(0, n)]
+            };
+            assert_eq!(lengths, expected);
+            let offset = boundary * PAGE - 1;
+            assert_eq!(page_window(&pages, offset, 2).is_none(), per_section == boundary);
+            assert!(write_physical(&pages, offset, &[17, 29]));
+            assert_eq!(page_bytes(pages[boundary - 1])[PAGE - 1], 17);
+            assert_eq!(page_bytes(pages[boundary])[0], 29);
+            assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        }
+    }
+
+    #[test]
+    fn section_cap_respects_remap_runs_and_title_mapping_boundaries() {
+        TEST_SECTION_PAGES.set(Some(4));
+        let n = 8;
+        let pages = allocate(n);
+        for (k, &page) in pages.iter().enumerate() {
+            assert!(write_physical(&[page], 0, &[40 + k as u8]));
+        }
+        let (a, b) = (reserve(n), reserve(n));
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, n, pages.as_ptr()), a as *mut c_void);
+        let layout = |base| {
+            physical()
+                .views
+                .range(base..base + n * PAGE)
+                .map(|(at, (len, _))| ((at - base) / PAGE, len / PAGE))
+                .collect::<Vec<_>>()
+        };
+        let contents = |base| {
+            (0..n).map(|k| {
+                let at = (base + k * PAGE) as *const c_void;
+                assert_eq!(query(at).host.State, MEM_COMMIT, "page {k}");
+                // SAFETY: the page is committed and nothing else changes this reservation.
+                unsafe { at.cast::<u8>().read() }
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(layout(a), [(0, 4), (4, 4)]);
+        // The new section boundary falls one page later than the old one.
+        let mut shifted = pages.clone();
+        shifted.rotate_right(1);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, n, shifted.as_ptr()), a as *mut c_void);
+        assert_eq!(contents(a), [47, 40, 41, 42, 43, 44, 45, 46]);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, n, pages.as_ptr()), a as *mut c_void);
+        {
+            let mut physical = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            assert!(alias_in_runs(&mut physical, b, a, n * PAGE));
+        }
+        assert_eq!(layout(b), [(0, 4), (4, 4)]);
+        assert_eq!(contents(b), [40, 41, 42, 43, 44, 45, 46, 47]);
+        let (a64, b64, p) = (a as u64, b as u64, PAGE as u64);
+        assert!(map_aliases(&[(b64, 0, n as u64 * p, false)]));
+        // The second title mapping crosses the section boundary. The first
+        // and second mappings also share consecutive pages of the first section.
+        assert!(map_aliases(&[(b64, a64, 2 * p, false), (b64 + 2 * p, a64 + 2 * p, 6 * p, false)]));
+        assert_eq!(layout(b), [(0, 2), (2, 2), (4, 4)]);
+        assert_eq!(contents(b), [40, 41, 42, 43, 44, 45, 46, 47]);
+        assert!(map_aliases(&[(b64, a64 + 6 * p, 2 * p, false)]));
+        assert_eq!(layout(b), [(0, 2), (2, 2), (4, 4)]);
+        assert_eq!(contents(b), [46, 47, 42, 43, 44, 45, 46, 47]);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        assert_eq!(contents(b), [46, 47, 42, 43, 44, 45, 46, 47]);
+        for base in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(base as *mut c_void, n, std::ptr::null()), base as *mut c_void);
+        }
+        TEST_SECTION_PAGES.set(None);
     }
 
     #[test]
