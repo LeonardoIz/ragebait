@@ -532,8 +532,13 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let _mapping = super::xmem::remap_lazy().then(victory_gpu::title_memory_reading);
+    // The kernel reads and writes the OVERLAPPED too, also at completion: a
+    // view made native stays so until the title maps that page again.
+    const OVERLAPPED_BYTES: usize = 32; // x64 OVERLAPPED
+    let overlapped_len = if overlapped.is_null() { 0 } else { OVERLAPPED_BYTES };
     if !super::xmem::prepare_cpu_pages(buffer as usize, len as usize)
         || !super::xmem::prepare_cpu_pages(read as usize, size_of::<u32>())
+        || !super::xmem::prepare_cpu_pages(overlapped as usize, overlapped_len)
     {
         // SAFETY: records why this thread's ReadFile failed.
         unsafe {
