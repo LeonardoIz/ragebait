@@ -152,6 +152,19 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+fn warm_entries(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    walkdir::WalkDir::new(root).into_iter().filter(|entry| {
+        // Keep root errors so a failed scan cannot be stamped as complete.
+        !entry.as_ref().is_err_and(|err| err.depth() != 0)
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn warm_entries_reports_an_invalid_root() {
+    assert!(matches!(warm_entries(Path::new("")).next(), Some(Err(err)) if err.depth() == 0));
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -183,7 +196,8 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<boo
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        for entry in warm_entries(root) {
+            let entry = entry?;
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }

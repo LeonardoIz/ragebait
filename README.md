@@ -106,7 +106,6 @@ The first start warms every shader and can take many minutes;
 | `VICTORY_SCRATCH_ANY_SIZE=1` | Off | A list's small first scratch chunk may reuse a kept 4 MiB chunk when no small one is kept |
 | `VICTORY_SCRATCH_SPARE_MB` | 128 | Set the most MiB of scratch chunks kept while no list holds them |
 | `VICTORY_READBACK_POOL=1` | Off | Reuse `VICTORY_TEXTURE_BACK` read-back buffers instead of creating one per copy-back. `VICTORY_READBACK_POOL_MB` caps the spare bytes (256) |
-| `VICTORY_DYNAMIC_SLOTS=<n>` | 262,144 | On a host view heap capped at 1,000,000 that cannot hold the title heap plus the dynamic slots, take `n` dynamic slots from the title's upper slots (at least 262,144, leaving 65,536 title slots). Tables past the kept title slots are made afresh |
 | `VICTORY_RAM_TRIM_MB=<MiB>` | Off | While available physical RAM is below this, sweep every 500 ms and empty the CPU snapshot, texture staging, and idle host-list pools (keeping 16 lists) |
 | `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
