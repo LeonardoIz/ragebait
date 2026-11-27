@@ -4023,12 +4023,25 @@ impl State {
                 };
                 match decoded {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        use crate::framelog::{T, add};
+                        // Where its host copy holds it (`VICTORY_CB_IN_PLACE=1`).
+                        let placed = crate::descriptor::host::cb_in_place()
+                            .then(|| crate::descriptor::host::constant_in_place(address, size))
+                            .flatten();
+                        if let Some((shadow, gpu, extent)) = placed {
+                            shadow.refresh(list, address, u64::from(extent));
+                            host.constant_at(index, gpu, extent, Some(shadow.buffer.clone()));
+                            add(T::ConstantsInPlace, 1);
+                            add(T::ConstantsInPlaceBytes, u64::from(size));
+                        } else {
+                            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                                host.make_null(index);
+                                continue;
+                            };
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            host.constant_at(index, gpu, size, None);
+                            add(T::ConstantsCopied, 1);
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             tally(13, 1);

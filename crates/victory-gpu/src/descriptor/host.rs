@@ -2366,9 +2366,10 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+    /// memory: the list's own, which it holds, or a host copy's `buffer`,
+    /// which the slot holds.
+    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32, buffer: Option<ID3D12Resource>) {
+        self.keep(index, buffer);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -3754,6 +3755,39 @@ fn constant_view_size(size: u32) -> u32 {
     size.min(MAX_CBV).next_multiple_of(256)
 }
 
+/// Whether the constant buffers of fresh tables are shown where their host
+/// copy already holds them (`VICTORY_CB_IN_PLACE=1`; off by default: their
+/// bytes are copied into the list's scratch memory at submission, as before).
+///
+/// A frame made some 23,000 such copies on the submit thread. In place, the
+/// view points at the buffer's host copy (`crate::shadow`), which the list
+/// brings up to date at submission like any buffer a draw reads (once per
+/// range per list, only what the title wrote since: its write watch), so a
+/// title that writes the constants again is seen. Views the host copy has not
+/// 256-byte aligned are copied as before. The frame log's "constant views"
+/// counts both kinds.
+pub(crate) fn cb_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CB_IN_PLACE").is_some_and(|v| v == "1"))
+}
+
+/// For [`cb_in_place`]: the host copy holding a constant view of `size` bytes
+/// at `address`, the card address the view shows, and the view's extent (the
+/// 64 KiB cap of [`make`] kept). `None` where the view must be copied: no
+/// host copy, or the address not 256-byte aligned in it.
+pub(crate) fn constant_in_place(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u32)> {
+    let extent = constant_view_size(size);
+    let shadow = crate::shadow::find(address, u64::from(extent))?;
+    let gpu = shadow.gpu(address);
+    in_place_extent(gpu, size).map(|extent| (shadow, gpu, extent))
+}
+
+/// The extent of a constant view at card address `gpu` shown in place, or
+/// `None` if the host cannot show it there (not 256-byte aligned).
+fn in_place_extent(gpu: u64, size: u32) -> Option<u32> {
+    gpu.is_multiple_of(256).then(|| constant_view_size(size))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4343,6 +4377,15 @@ mod tests {
         assert_eq!(constant_view_size(65_537), 65_536);
         assert_eq!(constant_view_size(u32::MAX), 65_536);
         assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
+
+    #[test]
+    fn constants_in_place_need_alignment_and_keep_the_cap() {
+        assert_eq!(in_place_extent(0x1_0000_0100, 16), Some(256));
+        assert_eq!(in_place_extent(0x1_0000_0000, 0), Some(0));
+        // A view the console aligned to 16 only is copied.
+        assert_eq!(in_place_extent(0x1_0000_0010, 256), None);
+        assert_eq!(in_place_extent(0x1_0000_0000, 1 << 20), Some(65_536));
     }
 
     /// Typed buffer views of 32-bit integer formats are made in the float
