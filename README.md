@@ -104,6 +104,7 @@ The first start warms every shader and can take many minutes;
 | `VICTORY_SYNC_LEAVE_NONE=1` | Off | The heap pass skips changed records with no view in slots that show none |
 | `VICTORY_SCRATCH_ANY_SIZE=1` | Off | A list's small first scratch chunk may reuse a kept 4 MiB chunk when no small one is kept |
 | `VICTORY_SCRATCH_SPARE_MB` | 128 | Set the most MiB of scratch chunks kept while no list holds them |
+| `VICTORY_READBACK_POOL=1` | Off | Reuse `VICTORY_TEXTURE_BACK` read-back buffers instead of creating one per copy-back. `VICTORY_READBACK_POOL_MB` caps the spare bytes (256) |
 | `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
 | `VICTORY_AMBIENT` | Off | Apply screen-space ambient lighting to explicitly selected compute passes |
 | `VICTORY_RT_DISPATCH_FIX=1` | Off | Honor DispatchX thread counts for ray-tracing builder stages |
