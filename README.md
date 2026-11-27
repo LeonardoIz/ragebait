@@ -79,6 +79,10 @@ prebuild after a driver or translator change.
 | `VICTORY_FFX_PASSTHROUGH` | On for Series S, off for Series X | Use a scaled copy in place of the console FidelityFX upscaler |
 | `VICTORY_WAVE_WIDE_SEEN` | On | Enable wave-wide branches for the built-in list of shader hashes |
 | `VICTORY_WAVE_WIDE_LIST` | Empty | Add comma-separated shader hashes to that selection |
+| `VICTORY_WAVE_LDS_LOOSE=1` | Off | Retry wave64 compute shaders on 32-lane hosts with LDS barriers at divergent region boundaries. A read may miss the other host wave's write within a region |
+| `VICTORY_SCC_LOCAL_ANY=1` | Off | Allow the local-wave retry to use each host wave's own result for scalar tests of whether a lane mask is nonempty |
+| `VICTORY_FAIR_DUE=1` | Off | Alternate due texture retries with fresh slots |
+| `VICTORY_RELOOK_MS` | 4,000 ms, or 20,000 ms with fair scheduling | Set the retry window for textures whose memory is missing. The window is clamped to 16–256 frames by default or 16–1,024 with fair scheduling or an explicit override |
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
 | `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
