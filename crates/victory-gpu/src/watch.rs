@@ -775,20 +775,24 @@ thread_local! {
     static ONE_VIEW_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// With [`open_one_view`]: before guarded `block` is noted clean, the views
-/// of its pages a fault left writable are made read-only again, or a later
-/// write through them would fault nothing and the block would stay clean.
-/// False if one of them could not be (then the block stays not clean).
+/// Before guarded `block` is noted clean, the views of its pages left
+/// writable are made read-only again (by a fault with [`open_one_view`], or
+/// a [`protect_alias`] that failed), or a later write through them would
+/// fault nothing and the block would stay clean. False if one of them could
+/// not be (then the block stays not clean, reported written at each check).
 fn rearm_aliases(g: &mut Guards, block: usize) -> bool {
-    if !open_one_view() || !g.aliased.contains(&block) {
+    if !g.aliased.contains(&block) {
+        return true;
+    }
+    let shown = crate::inplace::pages_of(block * BLOCK);
+    if shown.len() > MANY_VIEWS {
         return true;
     }
     let mut all = true;
-    for alias in crate::inplace::pages_of(block * BLOCK) {
+    for alias in shown {
         let alias = alias / BLOCK;
-        if alias != block && g.aliased.contains(&alias) && !g.protected.contains(&alias) {
-            protect_alias(g, alias);
-            all &= g.protected.contains(&alias);
+        if alias != block && g.aliased.contains(&alias) {
+            all &= protect_alias(g, alias);
         }
     }
     all
@@ -1168,12 +1172,18 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut all = true;
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block {
-                    protect_alias(g, alias);
+                    all &= protect_alias(g, alias);
                 }
+            }
+            if !all {
+                // A writable view would write these pages unseen: not
+                // clean, so reported written until `rearm_aliases` guards it.
+                g.clean.remove(&block);
             }
         }
     }
@@ -1202,11 +1212,12 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// next check and they would keep the bytes from before the write (`guard`
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
-/// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+/// its copies took them, `open` would have opened it. False if it is not
+/// read-only.
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     if g.protected.contains(&block) {
-        return;
+        return true;
     }
     let mut old = 0;
     let at = block * BLOCK;
@@ -1221,6 +1232,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
             g.viewed.insert(block);
         }
     }
+    guarded
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -2269,6 +2281,30 @@ mod tests {
         assert_eq!(guard(b, b + SIZE), Some(Vec::new()));
         ONE_VIEW_HERE.with(|on| on.set(false));
         drop_views(section, &[a, b], SIZE);
+    }
+
+    /// Another view of guarded pages that cannot be made read-only (here:
+    /// told of, but only reserved): the guarded view stays not clean, so
+    /// its pages are reported written at every check, until that view is
+    /// gone and every view of them is guarded.
+    #[test]
+    fn a_view_that_cannot_be_guarded_keeps_the_pages_written() {
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        const SIZE: usize = BLOCK;
+        let (section, a, b) = two_views(SIZE);
+        // SAFETY: a fresh reservation; never committed.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(reserved, 0);
+        crate::inplace::title_memory_view(reserved, SIZE, section, 0);
+        let page = a / PAGE;
+        assert_eq!(guard(a, a + SIZE), Some(vec![page]));
+        assert_eq!(guard(a, a + SIZE), Some(vec![page]), "a view is writable: not clean");
+        title_memory_remapped(reserved, SIZE);
+        assert_eq!(guard(a, a + SIZE), Some(vec![page]), "every view guarded now, then clean");
+        assert_eq!(guard(a, a + SIZE), Some(Vec::new()));
+        drop_views(section, &[a, b], SIZE);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(reserved as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the
