@@ -4034,12 +4034,18 @@ impl State {
                             add(T::ConstantsInPlace, 1);
                             add(T::ConstantsInPlaceBytes, u64::from(size));
                         } else {
-                            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                            // The slot holds the chunk too with `VICTORY_SLOT_HOLDS=1`.
+                            let scratch = if crate::descriptor::host::slot_holds() {
+                                list.scratch_held(u64::from(size)).map(|(b, gpu, to)| (Some(b), gpu, to))
+                            } else {
+                                list.scratch(u64::from(size)).map(|(gpu, to)| (None, gpu, to))
+                            };
+                            let Some((held, gpu, to)) = scratch else {
                                 host.make_null(index);
                                 continue;
                             };
                             list.defer_fill(to, address as *const u8, size as usize);
-                            host.constant_at(index, gpu, size, None);
+                            host.constant_at(index, gpu, size, held);
                             add(T::ConstantsCopied, 1);
                         }
                         #[cfg(feature = "diagnostics")]

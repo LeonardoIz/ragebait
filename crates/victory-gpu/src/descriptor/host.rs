@@ -2367,10 +2367,13 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory: the list's own, which it holds, or a host copy's `buffer`,
-    /// which the slot holds.
+    /// which the slot holds (with [`slot_holds`], the list's scratch chunk
+    /// too).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32, buffer: Option<ID3D12Resource>) {
-        self.keep(index, buffer);
-        let Some(host) = host() else { return };
+        let Some(host) = host() else {
+            self.keep(index, buffer);
+            return;
+        };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_view_size(size),
@@ -2380,6 +2383,9 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        // After the descriptor: what the slot showed before is let go once
+        // nothing shows it.
+        self.keep(index, buffer);
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -3753,6 +3759,21 @@ fn constant_view_size(size: u32) -> u32 {
     // through it, as on the console; rounded up from 1 it became 256 bytes of
     // whatever lies at its address in the host copy, and a floor flickered.
     size.min(MAX_CBV).next_multiple_of(256)
+}
+
+/// Whether a dynamic slot that shows a constant buffer in a list's scratch
+/// chunk holds that chunk too (`VICTORY_SLOT_HOLDS=1`; off by default: only
+/// the list holds it, until it is reset).
+///
+/// The slot shows the chunk until it is made again, and a shader that picks
+/// slots by an index it computes from stale data reads it through there; the
+/// chunks go back to the pool and are freed past its limit. The reference
+/// fork lost the device to a page fault in three freed chunks and holds them
+/// by default. Off here for the A/B: each such slot written again retires
+/// the reference it held (the frame log's retirements), on the submit thread.
+pub(crate) fn slot_holds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_some_and(|v| v == "1"))
 }
 
 /// Whether the constant buffers of fresh tables are shown where their host
