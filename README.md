@@ -85,6 +85,7 @@ prebuild after a driver or translator change.
 | `VICTORY_TEXTURE_WATCH=1` | Off | Recheck small textures recently found changed. Up to 32 early checks per frame get the first eighth of the pass's remaining time and staging budget |
 | `VICTORY_RELOOK_MS` | 4,000 ms, or 20,000 ms with fair scheduling | Set the retry window for textures whose memory is missing. The window is clamped to 16–256 frames by default or 16–1,024 with fair scheduling or an explicit override |
 | `VICTORY_LOOKUP_CACHE` | Off | Cache host buffer lookups per thread |
+| `VICTORY_REMAP_LAZY` | Off | Defer Windows views for GPU page aliases until accessed. Uses single-page views and takes precedence over `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. Works with `VICTORY_SECTION_MB` |
 | `VICTORY_REMAP_FAST` | Off | Skip remaps that would leave the same pages in place |
 | `VICTORY_REMAP_STATS` | Off | Measure physical-page remap churn, backing reuse, and time by operation |
 | `VICTORY_SECTION_MB=2` | Off | Cap physical-page backing sections at 2 MiB. Works with `VICTORY_MAP_RUNS` and `VICTORY_REMAP_BATCH`. DirectStorage uses its copy path for writes that cross sections |
@@ -113,6 +114,13 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 With `VICTORY_REMAP_STATS=1`, each present closes one measurement interval.
 `VICTORY_FRAME_LOG=1` logs a `frame N remap stats` line for that interval.
+The lazy counters show alias pages deferred, discarded before materialization,
+and materialized, including the subset resolved by a CPU fault. They also
+show failed materialization attempts and elapsed materialization time.
+Compare these alongside native unmapping time and whole-frame time. An
+alias that has acquired a native view still needs a native unmap when
+replaced or cleared. GPU residency checks, write guards, and kernel I/O
+can materialize aliases before the title touches them.
 The exit table combines all intervals, including `tail_calls` after the last
 present. It reports only aggregates.
 

@@ -4313,7 +4313,16 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    let backs = &list.deferred().backs;
+    if backs.is_empty() {
+        return;
+    }
+    let _mapping = crate::inplace::pin_remap_views();
+    for (buffer, at, [row, rows, pitch]) in backs {
+        let len = rows.saturating_sub(1) * pitch + row;
+        if crate::inplace::with_remap_views((0, 0), (*at, len), || ()).is_none() {
+            continue;
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -8630,9 +8639,13 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
+        // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let size = crate::inplace::with_remap_views((at as usize, 1), (0, 0), || {
+            // SAFETY: the query inspects an address and fills a local structure.
+            unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) }
+        })
+        .unwrap_or(0);
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -8687,9 +8700,11 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    crate::inplace::with_remap_views((src as usize, len), (dst as usize, len), || {
+        // SAFETY: the kernel checks both pointers, including the destination.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    })
+    .unwrap_or(false)
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -8725,7 +8740,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
-    let write = |at: usize, n: usize| {
+    let write_native = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         if direct {
@@ -8739,6 +8754,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+    };
+    let write = |at, n| {
+        crate::inplace::with_remap_views((0, 0), (at, n), || write_native(at, n)).unwrap_or(false)
     };
     if len == 0 || write(dst as usize, len) {
         return;

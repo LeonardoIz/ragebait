@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -31,6 +31,10 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
+
+mod lazy;
+
+pub(super) use lazy::{enabled as remap_lazy, prepare as prepare_cpu_pages, virtual_memory_module};
 
 const MIB: usize = 1 << 20;
 
@@ -154,23 +158,27 @@ fn virtual_alloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base,
-            size,
-            kind,
-            protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
-            constrained.into(),
-        )
-    };
+    // SAFETY: the pseudo handle requires no cleanup.
+    let process = unsafe { GetCurrentProcess() };
+    let at = lazy::allocate(process, base as usize, size, || {
+        // SAFETY: the arguments are the title's, stripped of console bits;
+        // the parameter points at requirements through the call.
+        unsafe {
+            VirtualAlloc2(
+                process,
+                base,
+                size,
+                kind,
+                protect,
+                if constrained {
+                    &mut parameter
+                } else {
+                    std::ptr::null_mut()
+                },
+                constrained.into(),
+            )
+        }
+    });
     if base.is_null() {
         tracing::debug!(
             size,
@@ -214,7 +222,7 @@ pub extern "system" fn XMemVirtualQuery(
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
-        if VirtualQueryEx(process, address, out.cast(), size) == 0 {
+        if lazy::query(process, address, out.cast(), size) == 0 {
             return 0;
         }
         let info = &mut *out;
@@ -890,7 +898,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
-    if observe_remap(&mut physical(), base, n * PAGE, |physical| map_pages(physical, base, n, pages)) {
+    let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
+        return std::ptr::null_mut();
+    };
+    if observe_remap(&mut physical(), base, len, |physical| map_pages(physical, base, n, pages)) {
         address
     } else {
         std::ptr::null_mut()
@@ -898,6 +909,9 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: *const usize) -> bool {
+    if lazy::enabled() {
+        return lazy::map_pages(physical, base, n, pages);
+    }
     if remap_fast() && same_pages(physical, base, n, pages) {
         return true;
     }
@@ -987,6 +1001,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 fn remap_alias(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
+    if lazy::enabled() {
+        return lazy::alias(physical, to, from, len);
+    }
     // `VICTORY_MAP_RUNS` leaves every page alone that shows what it is to
     // show already, which covers `VICTORY_REMAP_FAST`'s whole-call skip here.
     if remap_fast() && !map_runs() && same_alias(physical, to, from, len) {
@@ -1021,7 +1038,7 @@ fn remap_alias(physical: &mut Physical, to: usize, from: usize, len: usize) -> b
 /// 0.35 ms a page, one view each.
 fn map_runs() -> bool {
     static RUNS: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_MAP_RUNS").is_ok_and(|v| v.trim() == "1"));
-    *RUNS
+    !lazy::enabled() && *RUNS
 }
 
 /// The pages of a [`map_alias`] in runs `(first, end, same)`: pages that
@@ -1116,7 +1133,7 @@ fn reset_in(physical: &Physical, base: usize, len: usize) {
 pub(crate) fn remap_batch() -> bool {
     static BATCH: LazyLock<bool> =
         LazyLock::new(|| std::env::var("VICTORY_REMAP_BATCH").is_ok_and(|v| v.trim() == "1"));
-    *BATCH
+    !lazy::enabled() && *BATCH
 }
 
 /// Whether a mapping of `len` bytes at `to` from `from` (`from` 0 unmaps;
@@ -1248,6 +1265,20 @@ fn flush(
 /// run is left unmapped (sequentially, later ops would have mapped or kept
 /// it); upgrade if map failures stop being fatal.
 pub fn map_aliases(ops: &[(u64, u64, u64, bool)]) -> bool {
+    if lazy::enabled() {
+        let mut ok = true;
+        for &(to, from, len, repeat) in ops {
+            if len == 0 {
+                continue;
+            }
+            ok &= if repeat {
+                (0..len).step_by(PAGE).all(|k| map_alias(to + k, from, PAGE as u64))
+            } else {
+                map_alias(to, from, len)
+            };
+        }
+        return ok;
+    }
     let mut guard = physical();
     let physical = &mut *guard;
     let (mut ok, mut base, mut wanted, mut starts) = (true, 0, Vec::new(), Vec::new());

@@ -1010,6 +1010,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    if options & MEMORY_SOURCE != 0
+        && !super::xmem::prepare_cpu_pages(request.source as usize, request.source_size as usize)
+    {
+        return Err(fail(E_INVALIDARG, "materializing the source"));
+    }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
@@ -1205,6 +1210,12 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        // Hold the selected backing through the decode, including worker
+        // writes that do not enter the kernel or trigger the fault handler.
+        let _mapping = super::xmem::remap_lazy().then(victory_gpu::title_memory_reading);
+        if !super::xmem::prepare_cpu_pages(request.destination as usize, len) {
+            return Err(E_INVALIDARG);
+        }
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
@@ -1223,14 +1234,13 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
+    let count = (offset + len).div_ceil(PAGE);
+    if !super::xmem::prepare_cpu_pages(request.destination as usize, count * size_of::<usize>()) {
+        return Err(E_INVALIDARG);
+    }
     // SAFETY: the title passes a page number per 64 KiB of destination,
     // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), count) };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {

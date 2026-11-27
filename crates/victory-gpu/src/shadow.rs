@@ -3233,6 +3233,7 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        let _mapping = crate::inplace::pin_remap_views();
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -3339,6 +3340,7 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
+        let _mapping = crate::inplace::pin_remap_views();
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
@@ -4399,6 +4401,7 @@ impl Shadow {
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
+        let _mapping = crate::inplace::pin_remap_views();
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
@@ -4469,6 +4472,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let _mapping = crate::inplace::pin_remap_views();
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
